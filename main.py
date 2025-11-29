@@ -23,9 +23,7 @@ MY_SECRET = os.getenv("MY_SECRET", "tds2_secret")
 MY_EMAIL = os.getenv("MY_EMAIL", "22f2000771@ds.study.iitm.ac.in")
 MY_ID_STRING = "22f2000771" 
 GLOBAL_SUBMIT_URL = "https://tds-llm-analysis.s-anand.net/submit"
-
-# --- CRITICAL FIX: CORRECT MODEL NAME ---
-MODEL_NAME = 'gemini-2.5-flash' 
+MODEL_NAME = 'gemini-2.5-flash'
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -79,21 +77,6 @@ def global_sanitizer(text_input):
     text = text.replace(MY_ID_STRING, "[REDACTED_ID]")
     return text
 
-def safe_generate_content(model, prompt_content):
-    """Wrapper to handle Rate Limits (429)"""
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            return model.generate_content(prompt_content)
-        except Exception as e:
-            if "429" in str(e):
-                logger.warning(f"Rate Limit Hit. Sleeping 30s... (Attempt {attempt+1}/{max_retries})")
-                time.sleep(30)
-            else:
-                logger.error(f"Gemini Error: {e}")
-                return None
-    return None
-
 def ask_gemini(prompt, content=""):
     safety_settings = [
         {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
@@ -105,21 +88,22 @@ def ask_gemini(prompt, content=""):
     prompt = global_sanitizer(prompt)
     content = global_sanitizer(content)
     full_prompt = f"CONTEXT:\n{content}\n\nTASK:\n{prompt}"
-    
-    response = safe_generate_content(model, full_prompt)
-    return response.text.strip() if response and response.parts else ""
+    try:
+        response = model.generate_content(full_prompt)
+        return response.text.strip() if response.parts else ""
+    except Exception as e:
+        logger.error(f"Gemini Error: {e}")
+        return ""
 
 def ask_gemini_media(prompt, file_path):
-    logger.info(f"Processing Media: {file_path}")
     try:
         uploaded_file = genai.upload_file(path=file_path)
         while uploaded_file.state.name == "PROCESSING":
             time.sleep(1)
             uploaded_file = genai.get_file(uploaded_file.name)
-        
         model = genai.GenerativeModel(MODEL_NAME)
-        response = safe_generate_content(model, [prompt, uploaded_file])
-        return response.text.strip() if response else ""
+        response = model.generate_content([prompt, uploaded_file])
+        return response.text.strip()
     except Exception as e:
         logger.error(f"Media Error: {e}")
         return ""
@@ -144,8 +128,7 @@ def parse_quiz_page(html_content):
 
 def manual_url_extraction(html_content, current_url):
     links = []
-    # Catch JSON, CSV, Audio, Images
-    for m in re.finditer(r'href=["\'](.*?\.(csv|opus|mp3|pdf|json|png|jpg|jpeg))["\']', html_content):
+    for m in re.finditer(r'href=["\'](.*?\.(csv|opus|mp3|pdf|json|png|jpg))["\']', html_content):
         links.append(urljoin(current_url, m.group(1)))
     for m in re.finditer(r'href=["\'](.*?-data.*?)["\']', html_content):
         links.append(urljoin(current_url, m.group(1)))
@@ -157,8 +140,7 @@ def solve_quiz_loop(start_url):
     current_url = start_url
     
     while current_url:
-        # --- CRITICAL FIX: RATE LIMIT PROTECTION ---
-        logger.info("Sleeping 10s to respect Rate Limits...")
+        logger.info("Sleeping 10s...")
         time.sleep(10)
         
         try:
@@ -185,6 +167,7 @@ def solve_quiz_loop(start_url):
                 answer = None
                 context_info = ""
                 csv_file = None
+                json_file = None
 
                 data_urls = [u.strip() for u in str(task.get("data_url", "")).split(",") if u.strip()]
                 
@@ -203,15 +186,14 @@ def solve_quiz_loop(start_url):
                         context_info += f"\nIMAGE ANALYSIS: {desc}\n"
                         if len(desc) < 20: answer = desc
 
-                    elif f_path.endswith('.csv'):
-                        csv_file = f_path
+                    elif f_path.endswith('.csv'): csv_file = f_path
                     
-                    elif f_path.endswith('.pdf'):
+                    elif f_path.endswith('.json'):
+                        json_file = f_path
                         try:
-                            dfs = tabula.read_pdf(f_path, pages='all')
-                            if dfs: context_info += f"\nPDF TABLE: {dfs[0].to_string()}\n"
+                            with open(f_path, "r") as f: context_info += f"\nJSON DATA: {f.read()}\n"
                         except: pass
-                    
+
                     else:
                         try:
                             with open(f_path, "r", errors="ignore") as f: content = f.read(8000)
@@ -220,57 +202,68 @@ def solve_quiz_loop(start_url):
                         except: pass
 
                 if not answer:
-                    if csv_file:
+                    # SPECIAL CASE: GITHUB TREE
+                    if "gh-tree" in str(json_file):
+                        try:
+                            with open(json_file, "r") as f: tree_cfg = json.load(f)
+                            owner, repo, sha = tree_cfg["owner"], tree_cfg["repo"], tree_cfg["sha"]
+                            prefix = tree_cfg.get("path_prefix", "")
+                            
+                            api_url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{sha}?recursive=1"
+                            logger.info(f"Fetching GitHub Tree: {api_url}")
+                            # Need User Agent for GitHub API
+                            gh_res = requests.get(api_url, headers={"User-Agent": "agent"}).json()
+                            
+                            count = 0
+                            for item in gh_res.get("tree", []):
+                                if item["path"].startswith(prefix) and item["path"].endswith(".md"):
+                                    count += 1
+                            
+                            # Add Email Offset
+                            offset = len(MY_EMAIL) % 2 if MY_EMAIL else 0
+                            answer = count + offset
+                            logger.info(f"GitHub Count: {count} + Offset: {offset} = {answer}")
+                        except Exception as e:
+                            logger.error(f"GitHub Logic Failed: {e}")
+                            answer = 0
+
+                    elif csv_file:
                         try:
                             df = pd.read_csv(csv_file)
                             if any(str(col).replace('.','',1).isdigit() for col in df.columns):
                                 df = pd.read_csv(csv_file, header=None)
                                 df.columns = [chr(65+i) for i in range(len(df.columns))]
                             
-                            preview = df.head().to_string()
-                            
                             if "json" in task['question'].lower() or "array" in task['question'].lower():
-                                direct_prompt = (
-                                    f"Question: {task['question']}\nData (First 5): {preview}\n"
-                                    f"Write Python expression to convert `df` to requested JSON.\n"
-                                    f"Example: `df.to_json(orient='records')`\n"
-                                    f"Return ONLY expression."
-                                )
-                                expression = ask_gemini(direct_prompt).replace("```python", "").replace("```", "").strip()
-                                result = eval(expression, {"df": df, "pd": pd, "np": np})
-                                answer = str(result)
+                                # Valid JSON Script Logic
+                                script = ask_gemini(f"Write Python code to clean `df` (cols: {df.columns}) and return JSON string. Question: {task['question']}. Return ONLY code.").replace("```python", "").replace("```", "")
+                                # Execute logic safely
+                                # Easier fallback: Use Pandas to_json
+                                df_clean = df.copy() # Placeholder for complex logic
+                                # Ask Gemini to do it if small
+                                answer = ask_gemini(f"Convert this CSV data to the requested JSON format. CSV:\n{df.to_string()}\nQuestion: {task['question']}\nReturn VALID JSON only.")
+                                if "json" in answer.lower(): # Clean up markdown
+                                    answer = answer.replace("```json", "").replace("```", "").strip()
                             else:
-                                logic_prompt = (
-                                    f"Data: {preview}\nContext: {context_info}\nQuestion: {task['question']}\n"
-                                    f"Write Python expression for `df`.\n"
-                                    f"If Cutoff implied, use SUM of values > Cutoff.\n"
-                                    f"Return ONLY expression."
-                                )
-                                expression = ask_gemini(logic_prompt).replace("```python", "").replace("```", "").strip()
-                                result = eval(expression, {"df": df, "np": np})
+                                # Math
+                                logic = ask_gemini(f"Write Python expression for `df` to solve: {task['question']}. Return ONLY expression.").replace("```python", "").strip()
+                                result = eval(logic, {"df": df, "np": np})
                                 answer = int(result) if hasattr(result, 'real') else str(result)
                         except:
                             answer = int(df.select_dtypes(include=[np.number]).sum().sum())
 
                     elif context_info:
-                        if "uv" in task['question'].lower() and "http" in task['question'].lower():
-                            target_url = data_urls[0] if data_urls else "MISSING_URL"
-                            solve_prompt = (
-                                f"Task: Construct `uv http get` command.\nTarget: {target_url}\n"
-                                f"Headers: Accept: application/json, X-Email: {MY_EMAIL}\n"
-                                f"Return ONLY command."
-                            )
-                            answer = ask_gemini(solve_prompt)
+                        if "uv" in task['question'].lower():
+                            tgt = data_urls[0] if data_urls else "MISSING"
+                            answer = ask_gemini(f"Construct `uv http get` command for {tgt} with headers Accept: application/json, X-Email: {MY_EMAIL}. Return ONLY command.")
                         else:
-                            solve_prompt = f"Question: {task['question']}\nContext: {context_info}\nExtract answer. Return ONLY value."
-                            answer = ask_gemini(solve_prompt)
+                            answer = ask_gemini(f"Question: {task['question']}\nContext: {context_info}\nReturn answer.")
                     
                     else:
                         answer = ask_gemini(f"Question: {task['question']}\nHTML: {visible_text[:1000]}")
 
             try:
                 clean_ans = str(answer).strip().replace("**", "").replace("`", "").replace('"', '').replace("'", "")
-                
                 if len(clean_ans) > 150 and not clean_ans.startswith("uv") and not clean_ans.startswith("["): 
                     code_match = re.search(r'\b([a-zA-Z0-9]{5,20})\b', clean_ans)
                     if code_match: clean_ans = code_match.group(1)
@@ -278,11 +271,12 @@ def solve_quiz_loop(start_url):
                 if "secret is" in clean_ans.lower(): clean_ans = clean_ans.split("secret is")[-1].strip()
                 if MY_ID_STRING in clean_ans: clean_ans = ""
                 
-                if not clean_ans.startswith("["):
-                    if clean_ans.replace('.','',1).isdigit():
-                        answer = float(clean_ans) if '.' in clean_ans else int(clean_ans)
-                    else:
-                        answer = clean_ans
+                # Format check
+                if clean_ans.startswith("[") or clean_ans.startswith("{"):
+                    # It's JSON, keep it string
+                    answer = clean_ans.replace("'", '"') # Fix single quotes
+                elif clean_ans.replace('.','',1).isdigit():
+                    answer = float(clean_ans) if '.' in clean_ans else int(clean_ans)
                 else:
                     answer = clean_ans
             except: pass
@@ -290,7 +284,6 @@ def solve_quiz_loop(start_url):
             payload = {"email": MY_EMAIL, "secret": MY_SECRET, "url": current_url, "answer": answer}
             logger.info(f"Submitting: {payload}")
             res = requests.post(GLOBAL_SUBMIT_URL, json=payload)
-            
             try: res_json = res.json()
             except: res_json = {}
             logger.info(f"Result: {res_json}")

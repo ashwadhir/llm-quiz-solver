@@ -52,8 +52,8 @@ def download_file(file_url):
     return local_filename
 
 def ask_gemini(prompt, content=""):
-    """Sends a request to Gemini 1.5 Flash"""
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    """Sends a request to gemini-2.5-flash"""
+    model = genai.GenerativeModel('gemini-2.5-flash')
     full_prompt = f"{prompt}\n\nContext:\n{content}"
     response = model.generate_content(full_prompt)
     return response.text

@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 MY_SECRET = os.getenv("MY_SECRET", "default_secret")
-MY_EMAIL = os.getenv("MY_EMAIL", "your_email@example.com")
+MY_EMAIL = os.getenv("MY_EMAIL", "22f2000771@ds.study.iitm.ac.in")
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -77,6 +77,8 @@ def parse_quiz_page(html_content):
 
 # --- CORE SOLVER LOGIC ---
 
+# --- IMPROVED SOLVER LOGIC WITH RETRY ---
+
 def solve_quiz_loop(start_url):
     current_url = start_url
     
@@ -91,64 +93,84 @@ def solve_quiz_loop(start_url):
             task = parse_quiz_page(html)
             logger.info(f"Task: {task}")
             
-            answer = None
-            
-            # 3. Handle Data Files (CSV/PDF)
-            if task.get("data_url"):
-                file_path = download_file(task["data_url"])
+            # Inner loop for attempts (Max 2 attempts: Initial + 1 Retry)
+            for attempt in range(2): 
+                answer = None
                 
-                if file_path.endswith(".csv"):
-                    df = pd.read_csv(file_path)
-                    # Pass the dataframe head/columns to Gemini to figure out the math
-                    data_preview = df.head().to_string() + "\nColumns: " + str(df.columns.tolist())
+                # --- SOLVING LOGIC ---
+                # (Re-use the logic from before, but allowing for a 'retry' prompt)
+                
+                if task.get("data_url"):
+                    file_path = download_file(task["data_url"])
                     
-                    math_prompt = f"Given this CSV data preview: \n{data_preview}\n\nAnswer this question: {task['question']}. Return ONLY the result."
-                    answer = ask_gemini(math_prompt)
-
-                elif file_path.endswith(".pdf"):
-                    # Use Tabula to extract tables
-                    dfs = tabula.read_pdf(file_path, pages='all')
-                    if dfs:
-                        # Convert first table to string for Gemini
-                        table_str = dfs[0].to_string()
-                        math_prompt = f"Given this PDF table: \n{table_str}\n\nAnswer this question: {task['question']}. Return ONLY the result."
-                        answer = ask_gemini(math_prompt)
-                    else:
-                        logger.error("No tables found in PDF")
+                    if file_path.endswith(".csv"):
+                        df = pd.read_csv(file_path)
+                        data_preview = df.head().to_string() + "\nColumns: " + str(df.columns.tolist())
                         
-            else:
-                # 4. Pure Text Question
-                answer = ask_gemini(f"Answer this question briefly and directly: {task['question']}")
+                        # If retrying, ask to be more careful
+                        tone = "Double check your calculation." if attempt > 0 else "Return ONLY the result."
+                        math_prompt = f"Given this CSV data: \n{data_preview}\n\nQuestion: {task['question']}. {tone}"
+                        answer = ask_gemini(math_prompt)
 
-            # 5. Clean Answer (Remove extra text if strict number required)
-            # You might need to add logic here to cast to int/float if the quiz expects numbers
-            try:
-                # Attempt to convert to simple number if it looks like one
-                clean_ans = answer.strip()
-                if clean_ans.replace('.','',1).isdigit():
-                    answer = float(clean_ans) if '.' in clean_ans else int(clean_ans)
+                    elif file_path.endswith(".pdf"):
+                        dfs = tabula.read_pdf(file_path, pages='all')
+                        if dfs:
+                            table_str = dfs[0].to_string()
+                            tone = "Verify the numbers carefully." if attempt > 0 else "Return ONLY the result."
+                            math_prompt = f"PDF Table: \n{table_str}\n\nQuestion: {task['question']}. {tone}"
+                            answer = ask_gemini(math_prompt)
                 else:
-                    answer = clean_ans
-            except:
-                pass
+                    tone = "Think step by step." if attempt > 0 else "Answer briefly."
+                    answer = ask_gemini(f"Question: {task['question']}\n{tone}")
 
-            # 6. Submit
-            payload = {
-                "email": MY_EMAIL,
-                "secret": MY_SECRET,
-                "url": current_url,
-                "answer": answer
-            }
-            logger.info(f"Submitting: {payload}")
-            
-            res = requests.post(task["submit_url"], json=payload)
-            res_json = res.json()
-            logger.info(f"Result: {res_json}")
+                # Clean Answer Logic
+                try:
+                    clean_ans = str(answer).strip()
+                    # Remove markdown formatting if present
+                    clean_ans = clean_ans.replace("**", "").replace("`", "")
+                    if clean_ans.replace('.','',1).isdigit():
+                        answer = float(clean_ans) if '.' in clean_ans else int(clean_ans)
+                    else:
+                        answer = clean_ans
+                except:
+                    pass
 
-            # 7. Next Level?
-            if res_json.get("correct") and res_json.get("url"):
-                current_url = res_json["url"]
-            else:
+                # 3. Submit
+                payload = {
+                    "email": MY_EMAIL,
+                    "secret": MY_SECRET,
+                    "url": current_url,
+                    "answer": answer
+                }
+                logger.info(f"Submission Attempt {attempt+1}: {payload}")
+                
+                res = requests.post(task["submit_url"], json=payload)
+                res_json = res.json()
+                logger.info(f"Result: {res_json}")
+
+                # 4. DECISION MATRIX
+                if res_json.get("correct"):
+                    # Success! Follow the NEW url immediately
+                    current_url = res_json.get("url")
+                    break # Break inner attempt loop, go to next level
+                
+                else:
+                    # Wrong Answer
+                    logger.warning("Answer incorrect.")
+                    
+                    if attempt == 0:
+                        # If we have a retry left, continue the inner loop to try again
+                        logger.info("Retrying current level...")
+                        continue 
+                    else:
+                        # If we are out of retries, we MUST accept the server's next_url (if provided)
+                        # The user brief says: "url in your last response is the one you must follow"
+                        current_url = res_json.get("url")
+                        break # Break inner loop, move on
+
+            # End of While Loop safety check
+            if not current_url:
+                logger.info("No next URL provided. Quiz Finished.")
                 break
 
         except Exception as e:

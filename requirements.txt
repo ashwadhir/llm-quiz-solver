@@ -1,10 +1,9 @@
 fastapi
 uvicorn
 requests
-playwright
-pydantic
-google-generativeai
-tabula-py
 pandas
 numpy
+google-generativeai
+beautifulsoup4
+pillow
 python-multipart

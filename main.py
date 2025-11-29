@@ -23,6 +23,9 @@ MY_SECRET = os.getenv("MY_SECRET", "tds2_secret")
 MY_EMAIL = os.getenv("MY_EMAIL", "22f2000771@ds.study.iitm.ac.in")
 MY_ID_STRING = "22f2000771" 
 
+# Use the STABLE model name
+MODEL_NAME = 'gemini-2.5-flash'
+
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
@@ -64,7 +67,7 @@ def download_file(file_url):
         return None
 
 def global_sanitizer(text_input):
-    """Aggressively removes the User ID and Email from ANY string input"""
+    """Aggressively removes the User ID and Email"""
     if not isinstance(text_input, str): return text_input
     text = text_input
     if MY_EMAIL:
@@ -73,7 +76,7 @@ def global_sanitizer(text_input):
     return text
 
 def ask_gemini(prompt, content=""):
-    """Sends a request to Gemini 1.5 Flash"""
+    """Sends a request to Gemini"""
     safety_settings = [
         {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
         {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
@@ -81,17 +84,12 @@ def ask_gemini(prompt, content=""):
         {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
     ]
     
-    model = genai.GenerativeModel('gemini-2.5-flash', safety_settings=safety_settings)
+    model = genai.GenerativeModel(MODEL_NAME, safety_settings=safety_settings)
     
     prompt = global_sanitizer(prompt)
     content = global_sanitizer(content)
 
-    system_instruction = (
-        "You are a precise data extraction engine. "
-        "Output ONLY the requested value. "
-        "Do NOT return the user's email or ID."
-    )
-    full_prompt = f"{system_instruction}\n\nCONTEXT:\n{content}\n\nTASK:\n{prompt}"
+    full_prompt = f"CONTEXT:\n{content}\n\nTASK:\n{prompt}"
     
     try:
         response = model.generate_content(full_prompt)
@@ -111,7 +109,7 @@ def ask_gemini_audio(prompt, audio_path):
             time.sleep(1)
             audio_file = genai.get_file(audio_file.name)
 
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        model = genai.GenerativeModel(MODEL_NAME)
         response = model.generate_content([prompt, audio_file])
         return response.text.strip()
     except Exception as e:
@@ -119,7 +117,7 @@ def ask_gemini_audio(prompt, audio_path):
         return "0"
 
 def parse_quiz_page(html_content):
-    # Regex fallback
+    # Regex fallback for question
     question_text = "Calculate the sum."
     match = re.search(r'(Q\d+\.|Question:)(.{1,300})', html_content, re.IGNORECASE)
     if match:
@@ -127,8 +125,6 @@ def parse_quiz_page(html_content):
 
     prompt = f"""
     Analyze this HTML. Extract the JSON task.
-    If there are multiple file links, prioritize Audio (.opus, .mp3).
-    
     JSON Format:
     {{
         "question": "The exact question text.",
@@ -147,10 +143,24 @@ def parse_quiz_page(html_content):
     except:
         return {"question": question_text, "data_url": None, "submit_url": None}
 
-def clean_html_text(raw_html):
-    cleanr = re.compile('<.*?>')
-    cleantext = re.sub(cleanr, ' ', raw_html)
-    return ' '.join(cleantext.split())
+def manual_url_extraction(html_content, current_url):
+    """Fallback to find links if Gemini fails"""
+    # Look for common data patterns
+    patterns = [
+        r'href=["\'](.*?.csv)["\']',
+        r'href=["\'](.*?.opus)["\']',
+        r'href=["\'](.*?.mp3)["\']',
+        r'href=["\'](.*?.pdf)["\']',
+        r'href=["\'](.*?-data.*?)["\']' # Catches /demo-scrape-data
+    ]
+    for p in patterns:
+        match = re.search(p, html_content)
+        if match:
+            found_url = match.group(1)
+            # Ignore purely relative empty links
+            if len(found_url) > 2:
+                return urljoin(current_url, found_url)
+    return None
 
 # --- CORE SOLVER LOGIC ---
 
@@ -167,11 +177,21 @@ def solve_quiz_loop(start_url):
             # 2. Analyze with Gemini
             task = parse_quiz_page(html)
             
+            # --- URL FIXING LOGIC ---
             if task.get("data_url"):
                 task["data_url"] = urljoin(current_url, task["data_url"])
+            
             if task.get("submit_url"):
                 task["submit_url"] = urljoin(current_url, task["submit_url"])
             
+            # FALLBACK: If Gemini missed the data URL, find it manually
+            if not task.get("data_url"):
+                logger.info("Gemini missed data_url. Attempting manual regex...")
+                manual_link = manual_url_extraction(html, current_url)
+                if manual_link:
+                    logger.info(f"Manual regex found: {manual_link}")
+                    task["data_url"] = manual_link
+
             if not task.get("question"):
                 task["question"] = "Calculate the sum of the numbers."
 
@@ -193,24 +213,17 @@ def solve_quiz_loop(start_url):
                         math_prompt = f"Listen to this audio. {task['question']}. If asked for a sum, extract the numbers and sum them. Return ONLY the result."
                         answer = ask_gemini_audio(math_prompt, file_path)
 
-                    # 2. CSV FILES (FIXED HEADER LOGIC)
+                    # 2. CSV FILES
                     elif file_path.endswith(".csv"):
                         try:
-                            # Read normally first
                             df = pd.read_csv(file_path)
-                            
-                            # CRITICAL FIX: Check if header is actually data (numeric)
-                            # If columns look like numbers, reload with header=None
                             if any(str(col).replace('.','',1).isdigit() for col in df.columns):
-                                logger.info("Detected numeric header. Reloading with header=None")
                                 df = pd.read_csv(file_path, header=None)
 
                             numeric_df = df.select_dtypes(include=[np.number])
                             total_sum = numeric_df.sum().sum()
-                            logger.info(f"Python Calculated Sum: {total_sum}")
                             answer = int(total_sum)
-                        except Exception as e:
-                            logger.error(f"CSV Math failed: {e}")
+                        except:
                             answer = 0
 
                     # 3. PDF FILES
@@ -226,7 +239,7 @@ def solve_quiz_loop(start_url):
                         except:
                             answer = "0"
 
-                    # 4. GENERIC FILES (Script Chaser)
+                    # 4. GENERIC FILES
                     else:
                         try:
                             with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -236,8 +249,7 @@ def solve_quiz_loop(start_url):
 
                         raw_content = global_sanitizer(raw_content)
 
-                        # --- RECURSIVE SCRIPT CHASER ---
-                        # 1. Look for <script src="...">
+                        # Recursive Script Chaser
                         script_match = re.search(r'<script.*?src=["\'](.*?)["\'].*?>', raw_content)
                         if script_match:
                             script_name = script_match.group(1)
@@ -247,19 +259,15 @@ def solve_quiz_loop(start_url):
                                 raw_content += f"\n\n--- LINKED SCRIPT ({script_name}) ---\n{js_content}"
                             except: pass
 
-                        # 2. Look for 'import ... from "..."'
                         import_match = re.search(r'import.*?from\s+["\'](.*?)["\']', raw_content)
                         if import_match:
                             import_name = import_match.group(1)
                             import_url = urljoin(task["data_url"], import_name)
-                            logger.info(f"Found Import: {import_url}. Downloading...")
                             try:
                                 imported_content = requests.get(import_url, timeout=5).text
                                 imported_content = global_sanitizer(imported_content)
                                 raw_content += f"\n\n--- IMPORTED MODULE ({import_name}) ---\n{imported_content}"
-                            except Exception as e:
-                                logger.error(f"Failed to download import: {e}")
-                        # -----------------------------
+                            except: pass
 
                         extraction_prompt = (
                             f"QUESTION: {task['question']}\n"
@@ -269,7 +277,8 @@ def solve_quiz_loop(start_url):
                         answer = ask_gemini(extraction_prompt)
                         
                         if not answer or "[" in str(answer):
-                            answer = clean_html_text(raw_content).strip()
+                            cleanr = re.compile('<.*?>')
+                            answer = re.sub(cleanr, ' ', raw_content).strip()
 
                 else:
                     tone = "Think step by step." if attempt > 0 else "Answer directly."
@@ -281,9 +290,8 @@ def solve_quiz_loop(start_url):
                     if "secret is" in clean_ans.lower():
                         clean_ans = clean_ans.split("secret is")[-1].strip()
                     
-                    if MY_ID_STRING in clean_ans:
-                        clean_ans = ""
-
+                    if MY_ID_STRING in clean_ans: clean_ans = ""
+                    
                     if clean_ans.replace('.','',1).isdigit():
                         answer = float(clean_ans) if '.' in clean_ans else int(clean_ans)
                     else:
@@ -310,10 +318,7 @@ def solve_quiz_loop(start_url):
                     current_url = res_json.get("url")
                     break 
                 else:
-                    logger.warning("Answer incorrect.")
-                    if attempt == 0:
-                        logger.info("Retrying...")
-                        continue 
+                    if attempt == 0: continue 
                     else:
                         current_url = res_json.get("url")
                         break 

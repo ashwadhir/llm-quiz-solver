@@ -5,7 +5,7 @@ import logging
 import pandas as pd
 import tabula
 import google.generativeai as genai
-import re  # <--- NEW IMPORT FOR CLEANING HTML
+import re
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from pydantic import BaseModel
 from playwright.sync_api import sync_playwright
@@ -83,7 +83,6 @@ def ask_gemini(prompt, content=""):
         if response.parts:
             return response.text.strip()
         else:
-            logger.warning("Gemini returned no text parts.")
             return ""
     except Exception as e:
         logger.error(f"Gemini Error: {e}")
@@ -165,31 +164,37 @@ def solve_quiz_loop(start_url):
                             answer = "0"
 
                     elif file_path:
-                        # GENERIC FILE (HTML/Text) - ROBUST LOGIC
+                        # GENERIC FILE (HTML/Text) - SCRIPT CHASER LOGIC
                         try:
                             with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                                 raw_content = f.read(8000)
                         except:
                             raw_content = ""
 
-                        logger.info(f"Downloaded Content Preview: {raw_content[:200]}")
-                        
-                        # 1. Clean HTML tags to help Gemini
-                        text_content = clean_html_text(raw_content)
-                        
-                        # 2. Ask Gemini with CLEAN text
+                        # --- NEW: Check for linked scripts ---
+                        script_match = re.search(r'<script src="(.*?)".*?>', raw_content)
+                        if script_match:
+                            script_name = script_match.group(1)
+                            script_url = urljoin(task["data_url"], script_name)
+                            logger.info(f"Found linked script: {script_url}. Downloading...")
+                            try:
+                                js_content = requests.get(script_url, timeout=5).text
+                                raw_content += f"\n\n--- LINKED SCRIPT ({script_name}) ---\n{js_content}"
+                            except Exception as e:
+                                logger.error(f"Failed to download script: {e}")
+                        # -------------------------------------
+
+                        # Ask Gemini
                         extraction_prompt = (
                             f"QUESTION: {task['question']}\n"
-                            f"CONTENT: {text_content}\n"
-                            f"TASK: Extract the secret code or answer. Return ONLY the code."
+                            f"CONTENT: {raw_content}\n"
+                            f"TASK: Extract the secret code. Look inside the Script content if available."
                         )
                         answer = ask_gemini(extraction_prompt)
                         
-                        # 3. FALLBACK: If Gemini fails, use the raw text
+                        # FALLBACK
                         if not answer:
-                            logger.warning("Gemini failed. Using raw text fallback.")
-                            # Usually the secret is the only significant text in the body
-                            answer = text_content.strip()
+                            answer = clean_html_text(raw_content).strip()
 
                 else:
                     # Pure Text Question

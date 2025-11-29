@@ -36,14 +36,13 @@ def get_page_content(url):
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
         page.goto(url)
-        # Wait for potential hydration
-        page.wait_for_timeout(1000) 
+        page.wait_for_timeout(2000) # Give it 2s to fully render
         content = page.content()
         browser.close()
         return content
 
 def download_file(file_url):
-    """Downloads a file to /tmp/ and returns local path"""
+    """Downloads a file to /tmp/"""
     try:
         filename = file_url.split("/")[-1].split("?")[0]
         if not filename: filename = "downloaded_data"
@@ -61,14 +60,28 @@ def download_file(file_url):
         return None
 
 def ask_gemini(prompt, content=""):
-    """Sends a request to Gemini 2.5 Flash"""
-    model = genai.GenerativeModel('gemini-2.5-flash')
-    # System instruction to prevent "Tutorial Mode"
-    system_instruction = "You are a precise data extraction engine. You do NOT write code. You do NOT explain. You only output the requested value."
+    """Sends a request to Gemini 2.5 Flash with Safety Filters DISABLED"""
+    # 1. Disable all safety filters to prevent blocking legit data extraction
+    safety_settings = [
+        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+    ]
+    
+    model = genai.GenerativeModel('gemini-2.5-flash', safety_settings=safety_settings)
+    
+    system_instruction = "You are a data extraction engine. Output ONLY the requested value or JSON. No Markdown. No Explanations."
     full_prompt = f"{system_instruction}\n\nCONTEXT:\n{content}\n\nTASK:\n{prompt}"
+    
     try:
         response = model.generate_content(full_prompt)
-        return response.text.strip()
+        # Check if response has text part
+        if response.parts:
+            return response.text.strip()
+        else:
+            logger.warning("Gemini returned no text parts.")
+            return ""
     except Exception as e:
         logger.error(f"Gemini Error: {e}")
         return ""
@@ -78,15 +91,11 @@ def parse_quiz_page(html_content):
     prompt = """
     Analyze this HTML. Extract the JSON task.
     
-    If you see a question text (like "What is the sum...", "Find the code...", "Download file..."), extract it.
-    If the question is implied by a table or list, summarize the task.
-    
     JSON Format:
     {
-        "question": "The exact question text. If missing, summarize what needs to be done.",
+        "question": "The exact question text.",
         "data_url": "URL of file to download (or null)",
         "submit_url": "URL to POST answer to",
-        "format": "Expected answer type (number, string, json)"
     }
     Return ONLY raw JSON.
     """
@@ -120,7 +129,7 @@ def solve_quiz_loop(start_url):
             
             # Fail-safe if question is None
             if not task.get("question"):
-                task["question"] = "Analyze the data file and extract the key information or result requested."
+                task["question"] = "Extract the main answer or secret code from the page context."
 
             logger.info(f"Task Parsed: {task}")
             
@@ -134,11 +143,8 @@ def solve_quiz_loop(start_url):
                     
                     if file_path and file_path.endswith(".csv"):
                         df = pd.read_csv(file_path)
-                        # Send first 20 rows + column stats to ensure context
                         data_preview = df.head(20).to_string() + "\n\nColumn Info:\n" + str(df.dtypes)
-                        
-                        tone = "Be extremely precise with calculations." if attempt > 0 else "Return ONLY the numerical result."
-                        math_prompt = f"Data:\n{data_preview}\n\nQuestion: {task['question']}\n\n{tone}"
+                        math_prompt = f"Data:\n{data_preview}\n\nQuestion: {task['question']}\nReturn ONLY the numerical result."
                         answer = ask_gemini(math_prompt)
 
                     elif file_path and file_path.endswith(".pdf"):
@@ -146,33 +152,29 @@ def solve_quiz_loop(start_url):
                             dfs = tabula.read_pdf(file_path, pages='all')
                             if dfs:
                                 table_str = dfs[0].to_string()
-                                tone = "Check the rows carefully." if attempt > 0 else "Return ONLY the result."
-                                math_prompt = f"PDF Table:\n{table_str}\n\nQuestion: {task['question']}. {tone}"
+                                math_prompt = f"PDF Table:\n{table_str}\n\nQuestion: {task['question']}\nReturn ONLY the result."
                                 answer = ask_gemini(math_prompt)
                             else:
-                                answer = "0" # Fallback
+                                answer = "0"
                         except:
                             answer = "0"
 
                     elif file_path:
-                        # GENERIC FILE (HTML/Text/Scrape Target)
-                        # Fix for the "Tutorial Bug"
+                        # GENERIC FILE (HTML/Text) - Pass Content
                         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                             file_content = f.read(5000) 
                         
                         extraction_prompt = (
-                            f"I have downloaded the file mentioned in the question.\n"
-                            f"The file content is provided above.\n"
                             f"QUESTION: {task['question']}\n"
-                            f"TASK: Look at the file content. Extract the EXACT answer string requested (e.g. a secret code, a flag, a name). "
-                            f"Do NOT write a script. Do NOT explain how to find it. Just output the value found in the text."
+                            f"Look at the file content above. Extract the EXACT answer string requested. "
                         )
                         answer = ask_gemini(extraction_prompt, content=file_content)
 
                 else:
-                    # Pure Text Question
+                    # Pure Text Question - CRITICAL FIX: PASS HTML CONTENT
                     tone = "Think step by step." if attempt > 0 else "Answer directly."
-                    answer = ask_gemini(f"Question: {task['question']}\n{tone}")
+                    # We pass 'html' as the content context so Gemini can see the page!
+                    answer = ask_gemini(f"Question: {task['question']}\n{tone}", content=html[:20000])
 
                 # Clean Answer Logic
                 try:
@@ -192,19 +194,16 @@ def solve_quiz_loop(start_url):
                     "url": current_url,
                     "answer": answer
                 }
-                logger.info(f"Submission Attempt {attempt+1}: {payload}")
                 
-                # Check for valid Submit URL
                 if not task.get("submit_url"):
-                    logger.error("No submit URL found. Trying default /submit")
                     task["submit_url"] = urljoin(current_url, "/submit")
 
+                logger.info(f"Submitting: {payload}")
                 res = requests.post(task["submit_url"], json=payload)
                 
                 try:
                     res_json = res.json()
                 except:
-                    logger.error(f"Non-JSON response: {res.text}")
                     res_json = {}
 
                 logger.info(f"Result: {res_json}")
@@ -232,10 +231,7 @@ def solve_quiz_loop(start_url):
 
 @app.post("/")
 async def receive_task(task: QuizRequest, background_tasks: BackgroundTasks):
-    # Verify Secret
     if task.secret != MY_SECRET:
         raise HTTPException(status_code=403, detail="Invalid Secret")
-
-    # Start the loop in background
     background_tasks.add_task(solve_quiz_loop, task.url)
-    return {"message": "Task processing started"}
+    return {"message": "Processing"}

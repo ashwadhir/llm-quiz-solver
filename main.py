@@ -54,6 +54,12 @@ def get_page_content(url):
 def download_file(file_url):
     """Downloads a file to /tmp/"""
     try:
+        # Fix placeholders in URL (e.g. <your email>)
+        if "<your email>" in file_url and MY_EMAIL:
+            file_url = file_url.replace("<your email>", MY_EMAIL)
+        if "YOUR_EMAIL" in file_url and MY_EMAIL:
+            file_url = file_url.replace("YOUR_EMAIL", MY_EMAIL)
+
         filename = file_url.split("/")[-1].split("?")[0]
         if not filename: filename = f"data_{int(time.time())}"
         local_filename = f"/tmp/{filename}"
@@ -128,9 +134,8 @@ def parse_quiz_page(html_content):
 
 def manual_url_extraction(html_content, current_url):
     links = []
-    for m in re.finditer(r'href=["\'](.*?\.(csv|opus|mp3|pdf))["\']', html_content):
+    for m in re.finditer(r'href=["\'](.*?\.(csv|opus|mp3|pdf|json))["\']', html_content):
         links.append(urljoin(current_url, m.group(1)))
-    # Also look for data links like /demo-scrape-data
     for m in re.finditer(r'href=["\'](.*?-data.*?)["\']', html_content):
         links.append(urljoin(current_url, m.group(1)))
     return ",".join(list(set(links)))
@@ -153,7 +158,15 @@ def solve_quiz_loop(start_url):
             
             else:
                 task = parse_quiz_page(html)
-                if task.get("submit_url"): task["submit_url"] = urljoin(current_url, task["submit_url"])
+                
+                # --- URL FIXING LOGIC ---
+                if task.get("submit_url"): 
+                    task["submit_url"] = urljoin(current_url, task["submit_url"])
+                
+                # CRITICAL FIX: If submit_url is same as current page, force global submit
+                if task.get("submit_url") == current_url:
+                    task["submit_url"] = urljoin(current_url, "/submit")
+                    logger.info("Fixed Submit URL to global endpoint")
                 
                 manual_links = manual_url_extraction(html, current_url)
                 if manual_links:
@@ -175,7 +188,7 @@ def solve_quiz_loop(start_url):
                     if not f_path: continue
 
                     if f_path.endswith(('.opus', '.mp3', '.wav')):
-                        transcription = ask_gemini_audio(f"Transcribe audio. Identify any Cutoff values or Numbers. {task['question']}", f_path)
+                        transcription = ask_gemini_audio(f"Transcribe audio. {task['question']}", f_path)
                         context_info += f"\nAUDIO TRANSCRIPT: {transcription}\n"
                     
                     elif f_path.endswith('.csv'):
@@ -188,72 +201,49 @@ def solve_quiz_loop(start_url):
                         except: pass
                     
                     else:
-                        # GENERIC (Scripts/HTML)
                         try:
                             with open(f_path, "r", errors="ignore") as f: content = f.read(8000)
                             content = global_sanitizer(content)
-                            
-                            # Script Chaser
-                            script_match = re.search(r'<script.*?src=["\'](.*?)["\'].*?>', content)
-                            if script_match:
-                                s_url = urljoin(full_url, script_match.group(1))
-                                try: context_info += f"\nSCRIPT: {requests.get(s_url).text}\n"
-                                except: pass
-                            
                             context_info += f"\nFILE CONTENT: {content}\n"
                         except: pass
 
-                # 4. SOLVE
                 if csv_file:
                     try:
                         df = pd.read_csv(csv_file)
                         if any(str(col).replace('.','',1).isdigit() for col in df.columns):
                             df = pd.read_csv(csv_file, header=None)
                             df.columns = [chr(65+i) for i in range(len(df.columns))]
-
                         preview = df.head().to_string()
-                        
-                        # UPDATED PROMPT: Prefer Sum over Count
                         logic_prompt = (
-                            f"Data: {preview}\n"
-                            f"Context: {context_info}\n"
-                            f"Question: {task['question']}\n"
+                            f"Data: {preview}\nContext: {context_info}\nQuestion: {task['question']}\n"
                             f"Write Python expression for dataframe `df`.\n"
-                            f"IMPORTANT: If question implies a Cutoff, usually calculate the SUM of values > Cutoff, not the count.\n"
+                            f"If question implies Cutoff, use SUM of values > Cutoff.\n"
                             f"Return ONLY expression."
                         )
                         expression = ask_gemini(logic_prompt).replace("```python", "").replace("```", "").strip()
-                        logger.info(f"Executing: {expression}")
-                        
                         result = eval(expression, {"df": df, "np": np})
                         answer = int(result) if hasattr(result, 'real') else str(result)
-                    except Exception as e:
-                        logger.error(f"Pandas Logic Failed: {e}")
+                    except:
                         answer = int(df.select_dtypes(include=[np.number]).sum().sum())
 
                 elif context_info:
-                    # Generic File / Audio Answer
                     solve_prompt = (
                         f"Question: {task['question']}\nContext: {context_info}\n"
-                        f"Extract the answer. If it's a code, return ONLY the code string. "
-                        f"Do NOT write a tutorial. Do NOT explain."
+                        f"Extract the answer. Return ONLY the code/command string."
                     )
                     answer = ask_gemini(solve_prompt)
                 
                 else:
                     answer = ask_gemini(f"Question: {task['question']}\nHTML: {visible_text[:1000]}")
 
-            # CLEANUP & CHATTY FILTER
+            # CLEANUP (Relaxed for Commands)
             try:
                 clean_ans = str(answer).strip().replace("**", "").replace("`", "").replace('"', '').replace("'", "")
                 
-                # Filter out long "Tutorial" responses
-                if len(clean_ans) > 50 and " " in clean_ans:
-                    # Use Regex to extract code from chatty response
+                # CRITICAL FIX: Only aggressive filter if it looks like a paragraph
+                if len(clean_ans) > 150: 
                     code_match = re.search(r'\b([a-zA-Z0-9]{5,20})\b', clean_ans)
-                    if code_match: 
-                        clean_ans = code_match.group(1)
-                        logger.info(f"Extracted code from chatty response: {clean_ans}")
+                    if code_match: clean_ans = code_match.group(1)
 
                 if "secret is" in clean_ans.lower(): clean_ans = clean_ans.split("secret is")[-1].strip()
                 if MY_ID_STRING in clean_ans: clean_ans = ""
@@ -270,7 +260,15 @@ def solve_quiz_loop(start_url):
             
             logger.info(f"Submitting: {payload}")
             res = requests.post(task["submit_url"], json=payload)
-            res_json = res.json()
+            
+            # Handle non-JSON response (404/500 pages)
+            try:
+                res_json = res.json()
+            except:
+                logger.error(f"Server returned non-JSON: {res.text[:200]}")
+                # Retry strategy could go here, but usually indicates bad URL
+                res_json = {}
+
             logger.info(f"Result: {res_json}")
 
             if res_json.get("correct"):

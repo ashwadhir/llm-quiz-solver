@@ -1,21 +1,17 @@
 import os
 import json
-import time
-import logging
-import re
 import requests
+import logging
 import pandas as pd
 import tabula
 import google.generativeai as genai
+import re  # <--- NEW IMPORT FOR CLEANING HTML
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from pydantic import BaseModel
 from playwright.sync_api import sync_playwright
 from urllib.parse import urljoin
-from bs4 import BeautifulSoup
 
-# --------------------------------------------------------------------
-# CONFIG
-# --------------------------------------------------------------------
+# --- CONFIGURATION ---
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -32,375 +28,232 @@ class QuizRequest(BaseModel):
     secret: str
     url: str
 
-# --------------------------------------------------------------------
-# HELPERS
-# --------------------------------------------------------------------
+# --- HELPER FUNCTIONS ---
 
 def get_page_content(url):
-    logger.info(f"Scraping page: {url}")
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-            page.goto(url, timeout=30000)
-            page.wait_for_timeout(1500)
-            html = page.content()
-            browser.close()
-            return html
-    except Exception as e:
-        logger.error(f"Playwright error: {e}")
-        return ""
+    """Scrapes dynamic HTML using Playwright"""
+    logger.info(f"Scraping: {url}")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+        page.goto(url)
+        page.wait_for_timeout(2000) 
+        content = page.content()
+        browser.close()
+        return content
 
 def download_file(file_url):
+    """Downloads a file to /tmp/"""
     try:
-        filename = file_url.split("/")[-1].split("?")[0] or "downloaded"
-        local_path = f"/tmp/{filename}"
-        logger.info(f"Downloading {file_url} → {local_path}")
-        r = requests.get(file_url, stream=True, timeout=20)
-        r.raise_for_status()
-        with open(local_path, "wb") as f:
-            for chunk in r.iter_content(8192):
-                if chunk:
+        filename = file_url.split("/")[-1].split("?")[0]
+        if not filename: filename = "downloaded_data"
+        local_filename = f"/tmp/{filename}"
+        
+        logger.info(f"Downloading {file_url} to {local_filename}")
+        with requests.get(file_url, stream=True, timeout=10) as r:
+            r.raise_for_status()
+            with open(local_filename, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=8192):
                     f.write(chunk)
-        return local_path
+        return local_filename
     except Exception as e:
         logger.error(f"Download failed: {e}")
         return None
 
 def ask_gemini(prompt, content=""):
+    """Sends a request to Gemini 2.5 Flash with Safety Filters DISABLED"""
     safety_settings = [
         {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
         {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
         {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
         {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
     ]
+    
+    model = genai.GenerativeModel('gemini-2.5-flash', safety_settings=safety_settings)
+    
+    system_instruction = (
+        "You are a precise data extraction engine. "
+        "Output ONLY the requested value. "
+        "Do NOT return the user's email."
+    )
+    full_prompt = f"{system_instruction}\n\nCONTEXT:\n{content}\n\nTASK:\n{prompt}"
+    
     try:
-        model = genai.GenerativeModel("gemini-2.5-flash", safety_settings=safety_settings)
-        system_inst = "You are a precise data extraction engine. Output ONLY the requested result."
-        full_prompt = f"{system_inst}\n\nCONTEXT:\n{content}\n\nTASK:\n{prompt}"
-        resp = model.generate_content(full_prompt)
-        return resp.text.strip()
+        response = model.generate_content(full_prompt)
+        if response.parts:
+            return response.text.strip()
+        else:
+            logger.warning("Gemini returned no text parts.")
+            return ""
     except Exception as e:
-        logger.warning(f"Gemini call failed: {e}")
+        logger.error(f"Gemini Error: {e}")
         return ""
 
-def clean_llm_output(txt: str):
-    """Strip code fences, backticks, markdown and whitespace."""
-    if not isinstance(txt, str): return ""
-    s = txt.strip()
-    # remove triple/backtick fences
-    s = re.sub(r"```(?:json)?\s*", "", s, flags=re.IGNORECASE)
-    s = re.sub(r"\s*```$", "", s)
-    # remove single backticks and surrounding quotes
-    s = s.replace("`", "").strip()
-    # if wrapped in a JSON block, try to extract the JSON
-    try:
-        # attempt to find JSON substring
-        jmatch = re.search(r"\{.*\}", s, flags=re.DOTALL)
-        if jmatch:
-            js = jmatch.group(0)
-            return js.strip()
-    except:
-        pass
-    return s
-
-def try_parse_json_if_present(s: str):
-    s = s.strip()
-    try:
-        return json.loads(s)
-    except:
-        # try to fix common single quotes / trailing commas
-        try:
-            s2 = s.replace("'", '"')
-            s2 = re.sub(r",\s*}", "}", s2)
-            return json.loads(s2)
-        except:
-            return None
-
-def extract_secret_from_text(text: str):
-    """Heuristic: look for short alphanumeric token (6-40 chars) labeled 'secret' or 'code'."""
-    # look for labels
-    m = re.search(r"(?:secret|code|flag)[:\s]*([A-Za-z0-9_\-]{4,80})", text, flags=re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
-    # fallback: any long-ish alnum token
-    m2 = re.search(r"([A-Za-z0-9_\-]{6,80})", text)
-    if m2:
-        return m2.group(1)
-    return text.strip()[:200]
-
-# --------------------------------------------------------------------
-# PARSE PAGE (using LLM as fallback)
-# --------------------------------------------------------------------
-
-def parse_quiz_page(html):
-    # quick HTML heuristics
-    soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text("\n", strip=True)
-    # try to find obvious submit URL / data links
-    submit = None
-    data_link = None
-    # find anchor with /submit
-    a = soup.find("a", href=True)
-    if a and "/submit" in a["href"]:
-        submit = urljoin("https://example.com", a["href"])
-    # find any links ending with common data files
-    for tag in soup.find_all("a", href=True):
-        href = tag["href"]
-        if any(ext in href for ext in [".csv", ".pdf", "?"]):
-            data_link = href
-            break
-
-    # Minimal JSON-like detection in page
-    json_like = None
-    jmatch = re.search(r"\{[\s\S]{10,2000}\}", html)
-    if jmatch:
-        json_like = jmatch.group(0)
-
-    # If we found core pieces, return them; else use LLM fallback
-    if text and (submit or data_link or json_like):
-        return {
-            "question": text[:2000],
-            "data_url": data_link,
-            "submit_url": submit
-        }
-
-    # LLM fallback (limited prompt)
+def parse_quiz_page(html_content):
+    """Uses Gemini to extract JSON instructions from HTML"""
     prompt = """
-    Analyze this HTML and extract a small JSON with keys:
-    { "question": "...", "data_url": "... or null", "submit_url": "... or null" }
-    Return ONLY JSON.
+    Analyze this HTML. Extract the JSON task.
+    JSON Format:
+    {
+        "question": "The exact question text.",
+        "data_url": "URL of file to download (or null)",
+        "submit_url": "URL to POST answer to",
+    }
+    Return ONLY raw JSON.
     """
-    llm_out = ask_gemini(prompt, content=html[:30000])
-    cleaned = clean_llm_output(llm_out)
-    parsed = try_parse_json_if_present(cleaned)
-    if parsed and isinstance(parsed, dict):
-        return {
-            "question": parsed.get("question"),
-            "data_url": parsed.get("data_url"),
-            "submit_url": parsed.get("submit_url")
-        }
-    # fallback generic
-    return {"question": text[:2000], "data_url": None, "submit_url": None}
+    cleaned_text = ask_gemini(prompt, html_content[:40000]) 
+    cleaned_text = cleaned_text.replace("```json", "").replace("```", "").strip()
+    try:
+        return json.loads(cleaned_text)
+    except:
+        return {"question": "Extract data", "data_url": None, "submit_url": None}
 
-# --------------------------------------------------------------------
-# SOLVER LOOP
-# --------------------------------------------------------------------
+def clean_html_text(raw_html):
+    """Removes HTML tags to return clean text"""
+    cleanr = re.compile('<.*?>')
+    cleantext = re.sub(cleanr, ' ', raw_html)
+    return ' '.join(cleantext.split())
+
+# --- CORE SOLVER LOGIC ---
 
 def solve_quiz_loop(start_url):
     current_url = start_url
-    deadline = time.time() + 170  # give ~170s to finish
-    logger.info("Background solver started.")
-    while current_url and time.time() < deadline:
+    
+    while current_url:
         try:
-            logger.info(f"Processing quiz: {current_url}")
+            logger.info(f"--- Processing Level: {current_url} ---")
+            
+            # 1. Scrape Page
             html = get_page_content(current_url)
+            
+            # 2. Analyze with Gemini
             task = parse_quiz_page(html)
-            # make absolute
+            
             if task.get("data_url"):
                 task["data_url"] = urljoin(current_url, task["data_url"])
             if task.get("submit_url"):
                 task["submit_url"] = urljoin(current_url, task["submit_url"])
-            logger.info(f"Parsed task: {task}")
+            
+            if not task.get("question"):
+                task["question"] = "Extract the main answer or secret code from the page context."
 
-            question = task.get("question", "")
-            data_url = task.get("data_url")
-            submit_url = task.get("submit_url") or urljoin(current_url, "/submit")
+            logger.info(f"Task Parsed: {task}")
+            
+            for attempt in range(2): 
+                answer = None
+                
+                # --- SOLVING LOGIC ---
+                if task.get("data_url"):
+                    file_path = download_file(task["data_url"])
+                    
+                    if file_path and file_path.endswith(".csv"):
+                        df = pd.read_csv(file_path)
+                        data_preview = df.head(20).to_string() + "\n\nColumn Info:\n" + str(df.dtypes)
+                        math_prompt = f"Data:\n{data_preview}\n\nQuestion: {task['question']}\nReturn ONLY the numerical result."
+                        answer = ask_gemini(math_prompt)
 
-            answer = None
-
-            # ---------------------------
-            # If data_url is CSV -> deterministic sum logic (no LLM)
-            # ---------------------------
-            if data_url and data_url.lower().endswith(".csv"):
-                fp = download_file(data_url)
-                if fp:
-                    try:
-                        df = pd.read_csv(fp)
-                        # Heuristic: look for column named 'value' (case-insensitive)
-                        col_candidates = [c for c in df.columns if c.lower() in ("value","amount","sum","total","score","count")]
-                        if col_candidates:
-                            col = col_candidates[0]
-                            # compute sum deterministically
-                            numeric = pd.to_numeric(df[col], errors="coerce").fillna(0)
-                            summ = numeric.sum()
-                            # If question asks for integer, make int
-                            if float(summ).is_integer():
-                                answer = int(summ)
+                    elif file_path and file_path.endswith(".pdf"):
+                        try:
+                            dfs = tabula.read_pdf(file_path, pages='all')
+                            if dfs:
+                                table_str = dfs[0].to_string()
+                                math_prompt = f"PDF Table:\n{table_str}\n\nQuestion: {task['question']}\nReturn ONLY the result."
+                                answer = ask_gemini(math_prompt)
                             else:
-                                answer = float(summ)
-                        else:
-                            # fallback: sum all numeric columns
-                            numeric_df = df.select_dtypes(include=["number"])
-                            if not numeric_df.empty:
-                                sums = numeric_df.sum().sum()
-                                answer = int(sums) if float(sums).is_integer() else float(sums)
-                            else:
-                                # fallback to small-sample LLM if no numeric data
-                                preview = df.head(30).to_string()
-                                answer = ask_gemini(f"Data:\n{preview}\n\nQuestion: {question}\nReturn only the numerical result.")
-                    except Exception as e:
-                        logger.warning(f"CSV handling failed: {e}")
-                        answer = ask_gemini(f"Unable to parse CSV reliably. Question: {question}", content=html[:20000])
+                                answer = "0"
+                        except:
+                            answer = "0"
 
-            # ---------------------------
-            # PDF -> try tabula -> deterministic
-            # ---------------------------
-            elif data_url and data_url.lower().endswith(".pdf"):
-                fp = download_file(data_url)
-                if fp:
-                    try:
-                        dfs = tabula.read_pdf(fp, pages="all")
-                        if dfs and len(dfs) > 0:
-                            df0 = dfs[0]
-                            numeric_df = df0.select_dtypes(include=["number"])
-                            if not numeric_df.empty:
-                                s = numeric_df.sum().sum()
-                                answer = int(s) if float(s).is_integer() else float(s)
-                            else:
-                                # convert columns to numeric where possible and sum 'value' column if present
-                                cols = df0.columns
-                                for c in cols:
-                                    try:
-                                        df0[c] = pd.to_numeric(df0[c], errors="coerce")
-                                    except:
-                                        pass
-                                if 'value' in map(str.lower, map(str, cols)):
-                                    # find that column case-insensitive
-                                    idx = [i for i,c in enumerate(cols) if str(c).lower()=='value'][0]
-                                    colname = cols[idx]
-                                    s = pd.to_numeric(df0[colname], errors="coerce").fillna(0).sum()
-                                    answer = int(s) if float(s).is_integer() else float(s)
-                                else:
-                                    answer = ask_gemini(f"PDF table:\n{df0.head(20).to_string()}\nQuestion: {question}\nReturn only the result.")
-                        else:
-                            answer = ask_gemini(f"Question: {question}", content=html[:20000])
-                    except Exception as e:
-                        logger.warning(f"Tabula failed: {e}")
-                        answer = ask_gemini(f"Question: {question}", content=html[:20000])
+                    elif file_path:
+                        # GENERIC FILE (HTML/Text) - ROBUST LOGIC
+                        try:
+                            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                                raw_content = f.read(8000)
+                        except:
+                            raw_content = ""
 
-            # ---------------------------
-            # Generic file or page -> heuristic extraction
-            # ---------------------------
-            elif data_url:
-                fp = download_file(data_url)
-                if fp:
-                    try:
-                        with open(fp, "r", encoding="utf-8", errors="ignore") as f:
-                            txt = f.read(20000)
-                    except:
-                        txt = ""
-                    # Try simple secret extraction
-                    candidate = extract_secret_from_text(txt)
-                    # If candidate is short and numeric/alnum, use it
-                    if candidate and re.fullmatch(r"[A-Za-z0-9_\-]{4,80}", candidate):
-                        answer = candidate
-                    else:
-                        # fallback LLM
-                        llm = ask_gemini(f"QUESTION: {question}\n\nFILE CONTENT:\n{txt}\n\nReturn ONLY the required answer.")
-                        cleaned = clean_llm_output(llm)
-                        # if JSON returned, extract answer field
-                        js = try_parse_json_if_present(cleaned)
-                        if isinstance(js, dict) and "answer" in js:
-                            answer = js["answer"]
-                        else:
-                            answer = cleaned
+                        logger.info(f"Downloaded Content Preview: {raw_content[:200]}")
+                        
+                        # 1. Clean HTML tags to help Gemini
+                        text_content = clean_html_text(raw_content)
+                        
+                        # 2. Ask Gemini with CLEAN text
+                        extraction_prompt = (
+                            f"QUESTION: {task['question']}\n"
+                            f"CONTENT: {text_content}\n"
+                            f"TASK: Extract the secret code or answer. Return ONLY the code."
+                        )
+                        answer = ask_gemini(extraction_prompt)
+                        
+                        # 3. FALLBACK: If Gemini fails, use the raw text
+                        if not answer:
+                            logger.warning("Gemini failed. Using raw text fallback.")
+                            # Usually the secret is the only significant text in the body
+                            answer = text_content.strip()
 
-            else:
-                # No data_url: try to extract from page HTML deterministically
-                # Look for 'secret' label first
-                secret = extract_secret_from_text(html)
-                if secret and len(secret) >= 4:
-                    answer = secret
                 else:
-                    llm = ask_gemini(f"Question: {question}\n\nHTML:\n{html[:15000]}\nReturn only the answer.")
-                    cleaned = clean_llm_output(llm)
-                    js = try_parse_json_if_present(cleaned)
-                    if isinstance(js, dict) and "answer" in js:
-                        answer = js["answer"]
+                    # Pure Text Question
+                    tone = "Think step by step." if attempt > 0 else "Answer directly."
+                    answer = ask_gemini(f"Question: {task['question']}\n{tone}", content=html[:20000])
+
+                # Clean Answer Logic
+                try:
+                    clean_ans = str(answer).strip()
+                    clean_ans = clean_ans.replace("**", "").replace("`", "").replace('"', '').replace("'", "")
+                    if "secret is" in clean_ans.lower():
+                        clean_ans = clean_ans.split("secret is")[-1].strip()
+                    
+                    if clean_ans.replace('.','',1).isdigit():
+                        answer = float(clean_ans) if '.' in clean_ans else int(clean_ans)
                     else:
-                        answer = cleaned
+                        answer = clean_ans
+                except:
+                    pass
 
-            # final cleanup of answer
-            if isinstance(answer, str):
-                answer = answer.strip()
-                # if looks like a JSON payload, try to extract the 'answer' value
-                js = try_parse_json_if_present(answer)
-                if isinstance(js, dict) and "answer" in js:
-                    answer = js["answer"]
+                # 3. Submit
+                payload = {
+                    "email": MY_EMAIL,
+                    "secret": MY_SECRET,
+                    "url": current_url,
+                    "answer": answer
+                }
+                
+                if not task.get("submit_url"):
+                    task["submit_url"] = urljoin(current_url, "/submit")
 
-            logger.info(f"Computed Answer: {repr(answer)}")
+                logger.info(f"Submitting: {payload}")
+                res = requests.post(task["submit_url"], json=payload)
+                
+                try:
+                    res_json = res.json()
+                except:
+                    res_json = {}
 
-            # Submit
-            payload = {
-                "email": MY_EMAIL,
-                "secret": MY_SECRET,
-                "url": current_url,
-                "answer": answer
-            }
-            logger.info(f"Submitting payload to {submit_url}: {json.dumps({'email':payload['email'],'secret':'****','url':payload['url'],'answer':str(payload['answer'])})}")
-            try:
-                res = requests.post(submit_url, json=payload, timeout=20)
-                res.raise_for_status()
-                res_json = res.json()
-            except Exception as e:
-                logger.error(f"Submit failed: {e}")
+                logger.info(f"Result: {res_json}")
+
+                if res_json.get("correct"):
+                    current_url = res_json.get("url")
+                    break 
+                else:
+                    logger.warning("Answer incorrect.")
+                    if attempt == 0:
+                        logger.info("Retrying...")
+                        continue 
+                    else:
+                        current_url = res_json.get("url")
+                        break 
+
+            if not current_url:
+                logger.info("No next URL provided. Quiz Finished.")
                 break
 
-            logger.info(f"Submission Response: {res_json}")
-
-            if res_json.get("correct"):
-                # move to next url if provided
-                next_url = res_json.get("url")
-                if next_url:
-                    current_url = next_url
-                    logger.info("Answer accepted. Moving to next URL.")
-                    # respect optional delay provided by server
-                    delay = res_json.get("delay")
-                    if delay and isinstance(delay, (int,float)):
-                        logger.info(f"Sleeping for {delay}s as requested.")
-                        time.sleep(float(delay))
-                    break  # continue main while loop
-                else:
-                    logger.info("Answer correct and no new URL provided. Quiz finished successfully.")
-                    current_url = None
-                    break
-            else:
-                # incorrect - server may return next url or not
-                logger.warning(f"Answer incorrect. Reason: {res_json.get('reason')}")
-                # server sometimes returns a next URL even when incorrect
-                current_url = res_json.get("url")
-                if current_url:
-                    logger.info("Server provided a next URL despite incorrect answer. Continuing.")
-                    # respect delay if provided
-                    delay = res_json.get("delay")
-                    if delay and isinstance(delay, (int,float)):
-                        time.sleep(float(delay))
-                    continue
-                else:
-                    logger.info("No next URL; ending quiz loop.")
-                    current_url = None
-                    break
-
-        # end for attempts
-
-    # end while
-    if not current_url:
-        logger.info("END OF QUIZ: No more URLs. Quiz loop completed.")
-    elif time.time() >= deadline:
-        logger.info("END OF QUIZ: Deadline reached (time limit).")
-    logger.info("Background solver exiting.")
-    return
-
-# --------------------------------------------------------------------
-# API ENDPOINT (validate secret and return 200 immediately)
-# --------------------------------------------------------------------
+        except Exception as e:
+            logger.error(f"CRITICAL ERROR: {e}")
+            break
 
 @app.post("/")
 async def receive_task(task: QuizRequest, background_tasks: BackgroundTasks):
     if task.secret != MY_SECRET:
         raise HTTPException(status_code=403, detail="Invalid Secret")
-    # start background solver
     background_tasks.add_task(solve_quiz_loop, task.url)
-    # respond immediately 200 OK after validating secret
-    return {"message": "Processing started", "email": task.email, "url": task.url}
+    return {"message": "Processing"}

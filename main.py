@@ -21,7 +21,6 @@ logger = logging.getLogger(__name__)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 MY_SECRET = os.getenv("MY_SECRET", "tds2_secret")
 MY_EMAIL = os.getenv("MY_EMAIL", "22f2000771@ds.study.iitm.ac.in")
-# Hardcoded ID to scrub (extracted from your logs)
 MY_ID_STRING = "22f2000771" 
 
 if GEMINI_API_KEY:
@@ -68,15 +67,13 @@ def global_sanitizer(text_input):
     """Aggressively removes the User ID and Email from ANY string input"""
     if not isinstance(text_input, str): return text_input
     text = text_input
-    # Remove Email
     if MY_EMAIL:
         text = text.replace(MY_EMAIL, "[REDACTED_EMAIL]")
-    # Remove ID specifically
     text = text.replace(MY_ID_STRING, "[REDACTED_ID]")
     return text
 
 def ask_gemini(prompt, content=""):
-    """Sends a request to Gemini 2.5 Flash"""
+    """Sends a request to Gemini 1.5 Flash"""
     safety_settings = [
         {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
         {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
@@ -108,18 +105,14 @@ def ask_gemini(prompt, content=""):
         return ""
 
 def ask_gemini_audio(prompt, audio_path):
-    """Uploads audio to Gemini and asks question"""
     logger.info(f"Processing Audio: {audio_path}")
     try:
-        # Upload the file
         audio_file = genai.upload_file(path=audio_path)
-        
-        # Wait for processing (usually instant for small files)
         while audio_file.state.name == "PROCESSING":
             time.sleep(1)
             audio_file = genai.get_file(audio_file.name)
 
-        model = genai.GenerativeModel('gemini-2.5-flash')
+        model = genai.GenerativeModel('gemini-1.5-flash')
         response = model.generate_content([prompt, audio_file])
         return response.text.strip()
     except Exception as e:
@@ -127,9 +120,7 @@ def ask_gemini_audio(prompt, audio_path):
         return "0"
 
 def parse_quiz_page(html_content):
-    """Uses Gemini to extract JSON instructions from HTML"""
-    
-    # regex fallback
+    # Regex fallback for question
     question_text = "Calculate the sum."
     match = re.search(r'(Q\d+\.|Question:)(.{1,300})', html_content, re.IGNORECASE)
     if match:
@@ -183,9 +174,8 @@ def solve_quiz_loop(start_url):
             if not task.get("question"):
                 task["question"] = "Calculate the sum of the numbers."
 
-            # SANITIZE TASK DICTIONARY
+            # SANITIZE TASK
             task["question"] = global_sanitizer(task["question"])
-            
             logger.info(f"Task Parsed: {task}")
             
             for attempt in range(2): 
@@ -198,23 +188,36 @@ def solve_quiz_loop(start_url):
                     if not file_path:
                         answer = "Error downloading"
                     
-                    # 1. AUDIO FILES (.opus, .mp3, .wav)
+                    # 1. AUDIO FILES
                     elif file_path.endswith(('.opus', '.mp3', '.wav', '.ogg')):
                         math_prompt = f"Listen to this audio. {task['question']}. If asked for a sum, extract the numbers and sum them. Return ONLY the result."
                         answer = ask_gemini_audio(math_prompt, file_path)
 
-                    # 2. CSV FILES (Python Math)
+                    # 2. CSV FILES (SMART COLUMN SELECTOR)
                     elif file_path.endswith(".csv"):
                         try:
                             df = pd.read_csv(file_path)
-                            numeric_df = df.select_dtypes(include=[np.number])
-                            total_sum = numeric_df.sum().sum()
-                            logger.info(f"Python Calculated Sum: {total_sum}")
-                            answer = int(total_sum) 
-                        except:
+                            cols = df.columns.tolist()
+                            
+                            # Ask Gemini which column to sum
+                            col_prompt = f"Question: {task['question']}\nCSV Columns: {cols}\nWhich column name should be summed? Return ONLY the column name."
+                            target_col = ask_gemini(col_prompt).strip().replace("'", "").replace('"', "")
+                            
+                            if target_col in df.columns and pd.api.types.is_numeric_dtype(df[target_col]):
+                                total_sum = df[target_col].sum()
+                                logger.info(f"Summing column '{target_col}': {total_sum}")
+                                answer = int(total_sum)
+                            else:
+                                # Fallback: Sum ALL numeric columns if Gemini fails
+                                numeric_df = df.select_dtypes(include=[np.number])
+                                total_sum = numeric_df.sum().sum()
+                                logger.info(f"Summing ALL numeric columns: {total_sum}")
+                                answer = int(total_sum) 
+                        except Exception as e:
+                            logger.error(f"CSV Math failed: {e}")
                             answer = 0
 
-                    # 3. PDF FILES (Tabula)
+                    # 3. PDF FILES
                     elif file_path.endswith(".pdf"):
                         try:
                             dfs = tabula.read_pdf(file_path, pages='all')
@@ -235,16 +238,19 @@ def solve_quiz_loop(start_url):
                         except:
                             raw_content = ""
 
-                        # Check for linked scripts (Improved Regex)
+                        raw_content = global_sanitizer(raw_content)
+
+                        # Linked Script Chaser
                         script_match = re.search(r'<script.*?src=["\'](.*?)["\'].*?>', raw_content)
                         if script_match:
                             script_name = script_match.group(1)
                             script_url = urljoin(task["data_url"], script_name)
                             try:
                                 js_content = requests.get(script_url, timeout=5).text
+                                js_content = global_sanitizer(js_content)
                                 raw_content += f"\n\n--- SCRIPT CONTENT ---\n{js_content}"
-                            except Exception as e:
-                                logger.error(f"Failed to download script: {e}")
+                            except:
+                                pass
 
                         extraction_prompt = (
                             f"QUESTION: {task['question']}\n"
@@ -253,13 +259,10 @@ def solve_quiz_loop(start_url):
                         )
                         answer = ask_gemini(extraction_prompt)
                         
-                        if not answer:
+                        # Fallback logic for [SECRET_CODE] hallucination
+                        if not answer or "[" in str(answer) or "REDACTED" in str(answer):
+                            logger.warning("Gemini returned placeholder. Using raw text fallback.")
                             answer = clean_html_text(raw_content).strip()
-                        
-                        # DOUBLE CHECK: If answer is your ID, block it
-                        if MY_ID_STRING in str(answer):
-                            logger.warning("Agent attempted to submit ID. Blocking.")
-                            answer = ""
 
                 else:
                     # Pure Text Question
@@ -273,6 +276,10 @@ def solve_quiz_loop(start_url):
                     if "secret is" in clean_ans.lower():
                         clean_ans = clean_ans.split("secret is")[-1].strip()
                     
+                    # Prevent ID submission
+                    if MY_ID_STRING in clean_ans:
+                        clean_ans = ""
+
                     if clean_ans.replace('.','',1).isdigit():
                         answer = float(clean_ans) if '.' in clean_ans else int(clean_ans)
                     else:
@@ -293,12 +300,7 @@ def solve_quiz_loop(start_url):
 
                 logger.info(f"Submitting: {payload}")
                 res = requests.post(task["submit_url"], json=payload)
-                
-                try:
-                    res_json = res.json()
-                except:
-                    res_json = {}
-
+                res_json = res.json()
                 logger.info(f"Result: {res_json}")
 
                 if res_json.get("correct"):

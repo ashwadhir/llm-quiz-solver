@@ -36,7 +36,7 @@ def get_page_content(url):
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
         page.goto(url)
-        page.wait_for_timeout(2000) # Give it 2s to fully render
+        page.wait_for_timeout(2000) 
         content = page.content()
         browser.close()
         return content
@@ -61,7 +61,6 @@ def download_file(file_url):
 
 def ask_gemini(prompt, content=""):
     """Sends a request to Gemini 2.5 Flash with Safety Filters DISABLED"""
-    # 1. Disable all safety filters to prevent blocking legit data extraction
     safety_settings = [
         {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
         {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
@@ -71,12 +70,16 @@ def ask_gemini(prompt, content=""):
     
     model = genai.GenerativeModel('gemini-2.5-flash', safety_settings=safety_settings)
     
-    system_instruction = "You are a data extraction engine. Output ONLY the requested value or JSON. No Markdown. No Explanations."
+    # Updated System Instruction
+    system_instruction = (
+        "You are a precise data extraction engine. "
+        "You do NOT write code. You do NOT explain. "
+        "You only output the requested value."
+    )
     full_prompt = f"{system_instruction}\n\nCONTEXT:\n{content}\n\nTASK:\n{prompt}"
     
     try:
         response = model.generate_content(full_prompt)
-        # Check if response has text part
         if response.parts:
             return response.text.strip()
         else:
@@ -121,19 +124,16 @@ def solve_quiz_loop(start_url):
             # 2. Analyze with Gemini
             task = parse_quiz_page(html)
             
-            # Handle Relative URLs
             if task.get("data_url"):
                 task["data_url"] = urljoin(current_url, task["data_url"])
             if task.get("submit_url"):
                 task["submit_url"] = urljoin(current_url, task["submit_url"])
             
-            # Fail-safe if question is None
             if not task.get("question"):
                 task["question"] = "Extract the main answer or secret code from the page context."
 
             logger.info(f"Task Parsed: {task}")
             
-            # Inner loop for attempts (Max 2 attempts)
             for attempt in range(2): 
                 answer = None
                 
@@ -160,26 +160,41 @@ def solve_quiz_loop(start_url):
                             answer = "0"
 
                     elif file_path:
-                        # GENERIC FILE (HTML/Text) - Pass Content
-                        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                            file_content = f.read(5000) 
-                        
+                        # GENERIC FILE (HTML/Text) - IMPROVED PROMPT
+                        try:
+                            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                                file_content = f.read(8000) # Increased buffer
+                        except:
+                            file_content = "Could not read file."
+
                         extraction_prompt = (
                             f"QUESTION: {task['question']}\n"
-                            f"Look at the file content above. Extract the EXACT answer string requested. "
+                            f"--- FILE CONTENT START ---\n"
+                            f"{file_content}\n"
+                            f"--- FILE CONTENT END ---\n"
+                            f"TASK: Extract the secret code/answer from the file content above.\n"
+                            f"RULES:\n"
+                            f"1. Return ONLY the code/value.\n"
+                            f"2. Do NOT return an email address (like {MY_EMAIL}).\n"
+                            f"3. Do NOT return the URL.\n"
+                            f"4. Look for a flag, a random string, or text marked 'Secret'.\n"
                         )
-                        answer = ask_gemini(extraction_prompt, content=file_content)
+                        answer = ask_gemini(extraction_prompt)
 
                 else:
-                    # Pure Text Question - CRITICAL FIX: PASS HTML CONTENT
+                    # Pure Text Question
                     tone = "Think step by step." if attempt > 0 else "Answer directly."
-                    # We pass 'html' as the content context so Gemini can see the page!
                     answer = ask_gemini(f"Question: {task['question']}\n{tone}", content=html[:20000])
 
                 # Clean Answer Logic
                 try:
                     clean_ans = str(answer).strip()
                     clean_ans = clean_ans.replace("**", "").replace("`", "").replace('"', '').replace("'", "")
+                    
+                    # Fix: If Gemini says "The secret is ABC", extract just ABC
+                    if "secret is" in clean_ans.lower():
+                        clean_ans = clean_ans.split("secret is")[-1].strip()
+
                     if clean_ans.replace('.','',1).isdigit():
                         answer = float(clean_ans) if '.' in clean_ans else int(clean_ans)
                     else:

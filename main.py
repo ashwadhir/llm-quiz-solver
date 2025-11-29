@@ -8,6 +8,7 @@ import google.generativeai as genai
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from pydantic import BaseModel
 from playwright.sync_api import sync_playwright
+from urllib.parse import urljoin  # <--- NEW IMPORT
 
 # --- CONFIGURATION ---
 app = FastAPI()
@@ -42,7 +43,10 @@ def get_page_content(url):
 
 def download_file(file_url):
     """Downloads a file to /tmp/ and returns local path"""
-    local_filename = "/tmp/" + file_url.split("/")[-1]
+    # Sanitize filename to remove query parameters for saving
+    filename = file_url.split("/")[-1].split("?")[0]
+    local_filename = f"/tmp/{filename}"
+    
     logger.info(f"Downloading {file_url} to {local_filename}")
     with requests.get(file_url, stream=True) as r:
         r.raise_for_status()
@@ -64,20 +68,17 @@ def parse_quiz_page(html_content):
     Analyze this HTML. Extract the following JSON:
     {
         "question": "The exact question text",
-        "data_url": "The full URL of the PDF/CSV to download (or null)",
+        "data_url": "The URL of the file to download (or null)",
         "submit_url": "The URL to POST the answer to",
         "format": "The expected answer format (number, string, etc.)"
     }
     Return ONLY raw JSON.
     """
-    cleaned_text = ask_gemini(prompt, html_content[:20000]) # Send first 20k chars
-    # Clean up markdown code blocks if Gemini adds them
+    cleaned_text = ask_gemini(prompt, html_content[:25000]) 
     cleaned_text = cleaned_text.replace("```json", "").replace("```", "").strip()
     return json.loads(cleaned_text)
 
 # --- CORE SOLVER LOGIC ---
-
-# --- IMPROVED SOLVER LOGIC WITH RETRY ---
 
 def solve_quiz_loop(start_url):
     current_url = start_url
@@ -91,15 +92,21 @@ def solve_quiz_loop(start_url):
             
             # 2. Analyze with Gemini
             task = parse_quiz_page(html)
-            logger.info(f"Task: {task}")
             
-            # Inner loop for attempts (Max 2 attempts: Initial + 1 Retry)
+            # --- CRITICAL FIX: Handle Relative URLs ---
+            if task.get("data_url"):
+                task["data_url"] = urljoin(current_url, task["data_url"])
+            
+            if task.get("submit_url"):
+                task["submit_url"] = urljoin(current_url, task["submit_url"])
+                
+            logger.info(f"Task Parsed: {task}")
+            
+            # Inner loop for attempts (Max 2 attempts)
             for attempt in range(2): 
                 answer = None
                 
                 # --- SOLVING LOGIC ---
-                # (Re-use the logic from before, but allowing for a 'retry' prompt)
-                
                 if task.get("data_url"):
                     file_path = download_file(task["data_url"])
                     
@@ -107,18 +114,24 @@ def solve_quiz_loop(start_url):
                         df = pd.read_csv(file_path)
                         data_preview = df.head().to_string() + "\nColumns: " + str(df.columns.tolist())
                         
-                        # If retrying, ask to be more careful
                         tone = "Double check your calculation." if attempt > 0 else "Return ONLY the result."
                         math_prompt = f"Given this CSV data: \n{data_preview}\n\nQuestion: {task['question']}. {tone}"
                         answer = ask_gemini(math_prompt)
 
                     elif file_path.endswith(".pdf"):
+                        # Use Tabula to extract tables
                         dfs = tabula.read_pdf(file_path, pages='all')
                         if dfs:
                             table_str = dfs[0].to_string()
                             tone = "Verify the numbers carefully." if attempt > 0 else "Return ONLY the result."
                             math_prompt = f"PDF Table: \n{table_str}\n\nQuestion: {task['question']}. {tone}"
                             answer = ask_gemini(math_prompt)
+                    else:
+                        # Fallback for text files or scraping
+                        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                            file_content = f.read(2000) # Read first 2k chars
+                        answer = ask_gemini(f"File content: {file_content}\n\nQuestion: {task['question']}")
+
                 else:
                     tone = "Think step by step." if attempt > 0 else "Answer briefly."
                     answer = ask_gemini(f"Question: {task['question']}\n{tone}")
@@ -126,7 +139,6 @@ def solve_quiz_loop(start_url):
                 # Clean Answer Logic
                 try:
                     clean_ans = str(answer).strip()
-                    # Remove markdown formatting if present
                     clean_ans = clean_ans.replace("**", "").replace("`", "")
                     if clean_ans.replace('.','',1).isdigit():
                         answer = float(clean_ans) if '.' in clean_ans else int(clean_ans)
@@ -150,25 +162,17 @@ def solve_quiz_loop(start_url):
 
                 # 4. DECISION MATRIX
                 if res_json.get("correct"):
-                    # Success! Follow the NEW url immediately
                     current_url = res_json.get("url")
-                    break # Break inner attempt loop, go to next level
-                
+                    break 
                 else:
-                    # Wrong Answer
                     logger.warning("Answer incorrect.")
-                    
                     if attempt == 0:
-                        # If we have a retry left, continue the inner loop to try again
-                        logger.info("Retrying current level...")
+                        logger.info("Retrying...")
                         continue 
                     else:
-                        # If we are out of retries, we MUST accept the server's next_url (if provided)
-                        # The user brief says: "url in your last response is the one you must follow"
                         current_url = res_json.get("url")
-                        break # Break inner loop, move on
+                        break 
 
-            # End of While Loop safety check
             if not current_url:
                 logger.info("No next URL provided. Quiz Finished.")
                 break

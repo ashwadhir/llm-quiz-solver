@@ -21,9 +21,7 @@ logger = logging.getLogger(__name__)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 MY_SECRET = os.getenv("MY_SECRET", "tds2_secret")
 MY_EMAIL = os.getenv("MY_EMAIL", "22f2000771@ds.study.iitm.ac.in")
-MY_ID_STRING = "22f2000771" 
-
-# Use the STABLE model name
+MY_ID_STRING = "22f2000771"
 MODEL_NAME = 'gemini-2.5-flash'
 
 if GEMINI_API_KEY:
@@ -37,16 +35,26 @@ class QuizRequest(BaseModel):
 # --- HELPER FUNCTIONS ---
 
 def get_page_content(url):
-    """Scrapes dynamic HTML using Playwright"""
+    """Scrapes dynamic HTML using Playwright with Smart Waits"""
     logger.info(f"Scraping: {url}")
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
         page.goto(url)
-        page.wait_for_timeout(4000) 
+        
+        # Try to wait for the question or secret to appear
+        try:
+            page.wait_for_selector("body", timeout=5000)
+            # Short wait for JS execution
+            page.wait_for_timeout(2000)
+        except:
+            pass
+            
         content = page.content()
+        # Also get visible text to find "Secret code is..." easily
+        visible_text = page.inner_text("body")
         browser.close()
-        return content
+        return content, visible_text
 
 def download_file(file_url):
     """Downloads a file to /tmp/"""
@@ -67,36 +75,26 @@ def download_file(file_url):
         return None
 
 def global_sanitizer(text_input):
-    """Aggressively removes the User ID and Email"""
     if not isinstance(text_input, str): return text_input
     text = text_input
-    if MY_EMAIL:
-        text = text.replace(MY_EMAIL, "[REDACTED_EMAIL]")
+    if MY_EMAIL: text = text.replace(MY_EMAIL, "[REDACTED_EMAIL]")
     text = text.replace(MY_ID_STRING, "[REDACTED_ID]")
     return text
 
 def ask_gemini(prompt, content=""):
-    """Sends a request to Gemini"""
     safety_settings = [
         {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
         {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
         {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
         {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
     ]
-    
     model = genai.GenerativeModel(MODEL_NAME, safety_settings=safety_settings)
-    
     prompt = global_sanitizer(prompt)
     content = global_sanitizer(content)
-
     full_prompt = f"CONTEXT:\n{content}\n\nTASK:\n{prompt}"
-    
     try:
         response = model.generate_content(full_prompt)
-        if response.parts:
-            return response.text.strip()
-        else:
-            return ""
+        return response.text.strip() if response.parts else ""
     except Exception as e:
         logger.error(f"Gemini Error: {e}")
         return ""
@@ -108,59 +106,38 @@ def ask_gemini_audio(prompt, audio_path):
         while audio_file.state.name == "PROCESSING":
             time.sleep(1)
             audio_file = genai.get_file(audio_file.name)
-
         model = genai.GenerativeModel(MODEL_NAME)
         response = model.generate_content([prompt, audio_file])
         return response.text.strip()
     except Exception as e:
         logger.error(f"Audio Error: {e}")
-        return "0"
+        return ""
 
 def parse_quiz_page(html_content):
-    # Regex fallback for question
-    question_text = "Calculate the sum."
+    question_text = "Calculate the answer."
     match = re.search(r'(Q\d+\.|Question:)(.{1,300})', html_content, re.IGNORECASE)
-    if match:
-        question_text = match.group(0)
+    if match: question_text = match.group(0)
 
     prompt = f"""
-    Analyze this HTML. Extract the JSON task.
-    JSON Format:
-    {{
-        "question": "The exact question text.",
-        "data_url": "URL of file to download (or null)",
-        "submit_url": "URL to POST answer to",
-    }}
-    Return ONLY raw JSON.
+    Analyze HTML. Extract task. 
+    If multiple files exist, get ALL URLs separated by commas in 'data_url'.
+    JSON Format: {{ "question": "...", "data_url": "url1,url2", "submit_url": "..." }}
     """
     cleaned_text = ask_gemini(prompt, html_content[:50000]) 
     cleaned_text = cleaned_text.replace("```json", "").replace("```", "").strip()
     try:
         data = json.loads(cleaned_text)
-        if not data.get("question") or "Extract" in data.get("question"):
-             data["question"] = question_text
+        if not data.get("question"): data["question"] = question_text
         return data
     except:
         return {"question": question_text, "data_url": None, "submit_url": None}
 
 def manual_url_extraction(html_content, current_url):
-    """Fallback to find links if Gemini fails"""
-    # Look for common data patterns
-    patterns = [
-        r'href=["\'](.*?.csv)["\']',
-        r'href=["\'](.*?.opus)["\']',
-        r'href=["\'](.*?.mp3)["\']',
-        r'href=["\'](.*?.pdf)["\']',
-        r'href=["\'](.*?-data.*?)["\']' # Catches /demo-scrape-data
-    ]
-    for p in patterns:
-        match = re.search(p, html_content)
-        if match:
-            found_url = match.group(1)
-            # Ignore purely relative empty links
-            if len(found_url) > 2:
-                return urljoin(current_url, found_url)
-    return None
+    # Find all likely data links
+    links = []
+    for m in re.finditer(r'href=["\'](.*?\.(csv|opus|mp3|pdf))["\']', html_content):
+        links.append(urljoin(current_url, m.group(1)))
+    return ",".join(list(set(links)))
 
 # --- CORE SOLVER LOGIC ---
 
@@ -171,161 +148,130 @@ def solve_quiz_loop(start_url):
         try:
             logger.info(f"--- Processing Level: {current_url} ---")
             
-            # 1. Scrape Page
-            html = get_page_content(current_url)
+            # 1. Scrape Page & Visible Text
+            html, visible_text = get_page_content(current_url)
             
-            # 2. Analyze with Gemini
-            task = parse_quiz_page(html)
+            # FAST PATH: Check if secret is already visible (Level 2 Fix)
+            secret_match = re.search(r'Secret code is[:\s]*([A-Za-z0-9]+)', visible_text)
+            if secret_match:
+                logger.info("Found secret in visible text!")
+                task = parse_quiz_page(html) # Get submit URL
+                answer = secret_match.group(1)
+                # Skip download/solve steps
             
-            # --- URL FIXING LOGIC ---
-            if task.get("data_url"):
-                task["data_url"] = urljoin(current_url, task["data_url"])
-            
-            if task.get("submit_url"):
-                task["submit_url"] = urljoin(current_url, task["submit_url"])
-            
-            # FALLBACK: If Gemini missed the data URL, find it manually
-            if not task.get("data_url"):
-                logger.info("Gemini missed data_url. Attempting manual regex...")
-                manual_link = manual_url_extraction(html, current_url)
-                if manual_link:
-                    logger.info(f"Manual regex found: {manual_link}")
-                    task["data_url"] = manual_link
+            else:
+                # 2. Standard Analyze
+                task = parse_quiz_page(html)
+                
+                # Fix URLs
+                if task.get("submit_url"): task["submit_url"] = urljoin(current_url, task["submit_url"])
+                
+                # Manual Link Hunt if Gemini missed them
+                manual_links = manual_url_extraction(html, current_url)
+                if manual_links and not task.get("data_url"):
+                    task["data_url"] = manual_links
+                elif manual_links and task.get("data_url"):
+                    # Merge them
+                    task["data_url"] = task["data_url"] + "," + manual_links
 
-            if not task.get("question"):
-                task["question"] = "Calculate the sum of the numbers."
-
-            task["question"] = global_sanitizer(task["question"])
-            logger.info(f"Task Parsed: {task}")
-            
-            for attempt in range(2): 
+                task["question"] = global_sanitizer(task["question"])
+                logger.info(f"Task Parsed: {task}")
+                
+                # 3. Process Assets
                 answer = None
+                context_info = ""
+                csv_file = None
+
+                # Handle multiple files (Audio + CSV)
+                data_urls = [u.strip() for u in str(task.get("data_url", "")).split(",") if u.strip()]
                 
-                # --- SOLVING LOGIC ---
-                if task.get("data_url"):
-                    file_path = download_file(task["data_url"])
+                for d_url in data_urls:
+                    full_url = urljoin(current_url, d_url)
+                    f_path = download_file(full_url)
+                    if not f_path: continue
+
+                    if f_path.endswith(('.opus', '.mp3', '.wav')):
+                        # Audio: Transcribe/Extract info
+                        transcription = ask_gemini_audio(f"Transcribe this audio. Extract any cutoff values or instructions relevant to: {task['question']}", f_path)
+                        context_info += f"\nAUDIO TRANSCRIPT: {transcription}\n"
                     
-                    if not file_path:
-                        answer = "Error downloading"
+                    elif f_path.endswith('.csv'):
+                        csv_file = f_path
                     
-                    # 1. AUDIO FILES
-                    elif file_path.endswith(('.opus', '.mp3', '.wav', '.ogg')):
-                        math_prompt = f"Listen to this audio. {task['question']}. If asked for a sum, extract the numbers and sum them. Return ONLY the result."
-                        answer = ask_gemini_audio(math_prompt, file_path)
-
-                    # 2. CSV FILES
-                    elif file_path.endswith(".csv"):
+                    elif f_path.endswith('.pdf'):
                         try:
-                            df = pd.read_csv(file_path)
-                            if any(str(col).replace('.','',1).isdigit() for col in df.columns):
-                                df = pd.read_csv(file_path, header=None)
+                            dfs = tabula.read_pdf(f_path, pages='all')
+                            if dfs: context_info += f"\nPDF TABLE: {dfs[0].to_string()}\n"
+                        except: pass
 
-                            numeric_df = df.select_dtypes(include=[np.number])
-                            total_sum = numeric_df.sum().sum()
-                            answer = int(total_sum)
-                        except:
-                            answer = 0
+                # 4. SOLVE
+                if csv_file:
+                    # Smart Pandas Solver (Level 3 Fix)
+                    try:
+                        df = pd.read_csv(csv_file)
+                        # Reload with header=None if numeric headers detected
+                        if any(str(col).replace('.','',1).isdigit() for col in df.columns):
+                            df = pd.read_csv(csv_file, header=None)
+                            # Rename columns to A, B, C...
+                            df.columns = [chr(65+i) for i in range(len(df.columns))]
 
-                    # 3. PDF FILES
-                    elif file_path.endswith(".pdf"):
-                        try:
-                            dfs = tabula.read_pdf(file_path, pages='all')
-                            if dfs:
-                                table_str = dfs[0].to_string()
-                                math_prompt = f"PDF Table:\n{table_str}\n\nQuestion: {task['question']}\nReturn ONLY the result."
-                                answer = ask_gemini(math_prompt)
-                            else:
-                                answer = "0"
-                        except:
-                            answer = "0"
-
-                    # 4. GENERIC FILES
-                    else:
-                        try:
-                            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                                raw_content = f.read(8000)
-                        except:
-                            raw_content = ""
-
-                        raw_content = global_sanitizer(raw_content)
-
-                        # Recursive Script Chaser
-                        script_match = re.search(r'<script.*?src=["\'](.*?)["\'].*?>', raw_content)
-                        if script_match:
-                            script_name = script_match.group(1)
-                            script_url = urljoin(task["data_url"], script_name)
-                            try:
-                                js_content = requests.get(script_url, timeout=5).text
-                                raw_content += f"\n\n--- LINKED SCRIPT ({script_name}) ---\n{js_content}"
-                            except: pass
-
-                        import_match = re.search(r'import.*?from\s+["\'](.*?)["\']', raw_content)
-                        if import_match:
-                            import_name = import_match.group(1)
-                            import_url = urljoin(task["data_url"], import_name)
-                            try:
-                                imported_content = requests.get(import_url, timeout=5).text
-                                imported_content = global_sanitizer(imported_content)
-                                raw_content += f"\n\n--- IMPORTED MODULE ({import_name}) ---\n{imported_content}"
-                            except: pass
-
-                        extraction_prompt = (
-                            f"QUESTION: {task['question']}\n"
-                            f"CONTENT: {raw_content}\n"
-                            f"TASK: Extract the secret code. It is NOT '[REDACTED_ID]'."
-                        )
-                        answer = ask_gemini(extraction_prompt)
+                        preview = df.head().to_string()
                         
-                        if not answer or "[" in str(answer):
-                            cleanr = re.compile('<.*?>')
-                            answer = re.sub(cleanr, ' ', raw_content).strip()
+                        # Ask Gemini for Python Logic
+                        logic_prompt = (
+                            f"Data Preview:\n{preview}\n\n"
+                            f"Question: {task['question']}\n"
+                            f"Additional Context: {context_info}\n\n"
+                            f"Write a Python expression to calculate the answer using dataframe `df`.\n"
+                            f"Examples: `df['A'].sum()`, `df[df['A'] > 50]['B'].sum()`\n"
+                            f"Return ONLY the expression string."
+                        )
+                        expression = ask_gemini(logic_prompt).replace("```python", "").replace("```", "").strip()
+                        logger.info(f"Executing Expression: {expression}")
+                        
+                        # Execute (Safe-ish eval)
+                        result = eval(expression, {"df": df, "np": np})
+                        answer = int(result) if hasattr(result, 'real') else str(result)
+                    except Exception as e:
+                        logger.error(f"Pandas Logic Failed: {e}")
+                        # Fallback: Total Sum
+                        answer = int(df.select_dtypes(include=[np.number]).sum().sum())
 
-                else:
-                    tone = "Think step by step." if attempt > 0 else "Answer directly."
-                    answer = ask_gemini(f"Question: {task['question']}\n{tone}", content=html[:20000])
-
-                try:
-                    clean_ans = str(answer).strip()
-                    clean_ans = clean_ans.replace("**", "").replace("`", "").replace('"', '').replace("'", "")
-                    if "secret is" in clean_ans.lower():
-                        clean_ans = clean_ans.split("secret is")[-1].strip()
-                    
-                    if MY_ID_STRING in clean_ans: clean_ans = ""
-                    
-                    if clean_ans.replace('.','',1).isdigit():
-                        answer = float(clean_ans) if '.' in clean_ans else int(clean_ans)
-                    else:
-                        answer = clean_ans
-                except:
-                    pass
-
-                payload = {
-                    "email": MY_EMAIL,
-                    "secret": MY_SECRET,
-                    "url": current_url,
-                    "answer": answer
-                }
+                elif context_info:
+                    # Just Audio/PDF/Text
+                    solve_prompt = f"Question: {task['question']}\nContext: {context_info}\nReturn ONLY the answer."
+                    answer = ask_gemini(solve_prompt)
                 
-                if not task.get("submit_url"):
-                    task["submit_url"] = urljoin(current_url, "/submit")
-
-                logger.info(f"Submitting: {payload}")
-                res = requests.post(task["submit_url"], json=payload)
-                res_json = res.json()
-                logger.info(f"Result: {res_json}")
-
-                if res_json.get("correct"):
-                    current_url = res_json.get("url")
-                    break 
                 else:
-                    if attempt == 0: continue 
-                    else:
-                        current_url = res_json.get("url")
-                        break 
+                    # Generic / Text only
+                    answer = ask_gemini(f"Question: {task['question']}\nHTML: {visible_text[:1000]}")
 
-            if not current_url:
-                logger.info("No next URL provided. Quiz Finished.")
-                break
+            # CLEANUP
+            try:
+                clean_ans = str(answer).strip().replace("**", "").replace("`", "").replace('"', '').replace("'", "")
+                if "secret is" in clean_ans.lower(): clean_ans = clean_ans.split("secret is")[-1].strip()
+                if MY_ID_STRING in clean_ans: clean_ans = ""
+                
+                if clean_ans.replace('.','',1).isdigit():
+                    answer = float(clean_ans) if '.' in clean_ans else int(clean_ans)
+                else:
+                    answer = clean_ans
+            except: pass
+
+            # SUBMIT
+            payload = {"email": MY_EMAIL, "secret": MY_SECRET, "url": current_url, "answer": answer}
+            if not task.get("submit_url"): task["submit_url"] = urljoin(current_url, "/submit")
+            
+            logger.info(f"Submitting: {payload}")
+            res = requests.post(task["submit_url"], json=payload)
+            res_json = res.json()
+            logger.info(f"Result: {res_json}")
+
+            if res_json.get("correct"):
+                current_url = res_json.get("url")
+            else:
+                current_url = res_json.get("url") # Force move to next if available, or loop ends
+                if not current_url: break
 
         except Exception as e:
             logger.error(f"CRITICAL ERROR: {e}")

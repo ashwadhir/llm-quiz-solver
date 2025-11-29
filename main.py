@@ -22,8 +22,10 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 MY_SECRET = os.getenv("MY_SECRET", "tds2_secret")
 MY_EMAIL = os.getenv("MY_EMAIL", "22f2000771@ds.study.iitm.ac.in")
 MY_ID_STRING = "22f2000771" 
-MODEL_NAME = 'gemini-2.5-flash'
 GLOBAL_SUBMIT_URL = "https://tds-llm-analysis.s-anand.net/submit"
+
+# --- CRITICAL FIX: CORRECT MODEL NAME ---
+MODEL_NAME = 'gemini-2.5-flash' 
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -77,6 +79,21 @@ def global_sanitizer(text_input):
     text = text.replace(MY_ID_STRING, "[REDACTED_ID]")
     return text
 
+def safe_generate_content(model, prompt_content):
+    """Wrapper to handle Rate Limits (429)"""
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            return model.generate_content(prompt_content)
+        except Exception as e:
+            if "429" in str(e):
+                logger.warning(f"Rate Limit Hit. Sleeping 30s... (Attempt {attempt+1}/{max_retries})")
+                time.sleep(30)
+            else:
+                logger.error(f"Gemini Error: {e}")
+                return None
+    return None
+
 def ask_gemini(prompt, content=""):
     safety_settings = [
         {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
@@ -88,15 +105,11 @@ def ask_gemini(prompt, content=""):
     prompt = global_sanitizer(prompt)
     content = global_sanitizer(content)
     full_prompt = f"CONTEXT:\n{content}\n\nTASK:\n{prompt}"
-    try:
-        response = model.generate_content(full_prompt)
-        return response.text.strip() if response.parts else ""
-    except Exception as e:
-        logger.error(f"Gemini Error: {e}")
-        return ""
+    
+    response = safe_generate_content(model, full_prompt)
+    return response.text.strip() if response and response.parts else ""
 
 def ask_gemini_media(prompt, file_path):
-    """Handles Audio AND Images"""
     logger.info(f"Processing Media: {file_path}")
     try:
         uploaded_file = genai.upload_file(path=file_path)
@@ -105,8 +118,8 @@ def ask_gemini_media(prompt, file_path):
             uploaded_file = genai.get_file(uploaded_file.name)
         
         model = genai.GenerativeModel(MODEL_NAME)
-        response = model.generate_content([prompt, uploaded_file])
-        return response.text.strip()
+        response = safe_generate_content(model, [prompt, uploaded_file])
+        return response.text.strip() if response else ""
     except Exception as e:
         logger.error(f"Media Error: {e}")
         return ""
@@ -144,6 +157,10 @@ def solve_quiz_loop(start_url):
     current_url = start_url
     
     while current_url:
+        # --- CRITICAL FIX: RATE LIMIT PROTECTION ---
+        logger.info("Sleeping 10s to respect Rate Limits...")
+        time.sleep(10)
+        
         try:
             logger.info(f"--- Processing Level: {current_url} ---")
             html, visible_text = get_page_content(current_url)
@@ -177,23 +194,18 @@ def solve_quiz_loop(start_url):
                     f_path = download_file(full_url)
                     if not f_path: continue
 
-                    # AUDIO
                     if f_path.endswith(('.opus', '.mp3', '.wav')):
                         transcription = ask_gemini_media(f"Transcribe. {task['question']}", f_path)
                         context_info += f"\nAUDIO TRANSCRIPT: {transcription}\n"
                     
-                    # IMAGES (NEW!)
                     elif f_path.endswith(('.png', '.jpg', '.jpeg')):
-                        desc = ask_gemini_media(f"Look at image. {task['question']}. Return ONLY the requested value (e.g. hex color).", f_path)
+                        desc = ask_gemini_media(f"Analyze image. {task['question']}. Return ONLY the requested value (e.g. hex color).", f_path)
                         context_info += f"\nIMAGE ANALYSIS: {desc}\n"
-                        # If image analysis is strong, it might be the answer directly
                         if len(desc) < 20: answer = desc
 
-                    # CSV
                     elif f_path.endswith('.csv'):
                         csv_file = f_path
                     
-                    # PDF
                     elif f_path.endswith('.pdf'):
                         try:
                             dfs = tabula.read_pdf(f_path, pages='all')
@@ -211,38 +223,23 @@ def solve_quiz_loop(start_url):
                     if csv_file:
                         try:
                             df = pd.read_csv(csv_file)
-                            # Handle Numeric Headers
                             if any(str(col).replace('.','',1).isdigit() for col in df.columns):
                                 df = pd.read_csv(csv_file, header=None)
                                 df.columns = [chr(65+i) for i in range(len(df.columns))]
                             
                             preview = df.head().to_string()
                             
-                            # CHECK: Is it a JSON transformation task?
                             if "json" in task['question'].lower() or "array" in task['question'].lower():
-                                # Use Gemini to write a cleaning script
-                                logic_prompt = (
-                                    f"Data: {preview}\nQuestion: {task['question']}\n"
-                                    f"Write a Python script to transform `df` into the requested JSON string.\n"
-                                    f"Return ONLY the JSON string output by the script."
-                                )
-                                # For complex transformations, we might need a stronger prompt or execute code
-                                # Simpler approach: Ask Gemini to do the transform directly on the preview
-                                # IF the dataset is small. If large, we need code.
-                                # Let's try direct transformation first as these CSVs are usually small-ish
                                 direct_prompt = (
-                                    f"Question: {task['question']}\n"
-                                    f"Data (First 5 rows): {preview}\n"
-                                    f"Instructions: Write a Python expression that converts `df` to the requested JSON format.\n"
+                                    f"Question: {task['question']}\nData (First 5): {preview}\n"
+                                    f"Write Python expression to convert `df` to requested JSON.\n"
                                     f"Example: `df.to_json(orient='records')`\n"
-                                    f"Return ONLY the expression."
+                                    f"Return ONLY expression."
                                 )
                                 expression = ask_gemini(direct_prompt).replace("```python", "").replace("```", "").strip()
                                 result = eval(expression, {"df": df, "pd": pd, "np": np})
                                 answer = str(result)
-                            
                             else:
-                                # Standard Math Task
                                 logic_prompt = (
                                     f"Data: {preview}\nContext: {context_info}\nQuestion: {task['question']}\n"
                                     f"Write Python expression for `df`.\n"
@@ -273,6 +270,7 @@ def solve_quiz_loop(start_url):
 
             try:
                 clean_ans = str(answer).strip().replace("**", "").replace("`", "").replace('"', '').replace("'", "")
+                
                 if len(clean_ans) > 150 and not clean_ans.startswith("uv") and not clean_ans.startswith("["): 
                     code_match = re.search(r'\b([a-zA-Z0-9]{5,20})\b', clean_ans)
                     if code_match: clean_ans = code_match.group(1)
@@ -280,7 +278,6 @@ def solve_quiz_loop(start_url):
                 if "secret is" in clean_ans.lower(): clean_ans = clean_ans.split("secret is")[-1].strip()
                 if MY_ID_STRING in clean_ans: clean_ans = ""
                 
-                # Don't convert JSON arrays to floats
                 if not clean_ans.startswith("["):
                     if clean_ans.replace('.','',1).isdigit():
                         answer = float(clean_ans) if '.' in clean_ans else int(clean_ans)

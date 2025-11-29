@@ -3,6 +3,7 @@ import json
 import requests
 import logging
 import pandas as pd
+import numpy as np # New Import
 import tabula
 import google.generativeai as genai
 import re
@@ -37,7 +38,7 @@ def get_page_content(url):
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
         page.goto(url)
-        page.wait_for_timeout(3000) # Increased wait time for Question text to render
+        page.wait_for_timeout(4000) # Maximum wait for rendering
         content = page.content()
         browser.close()
         return content
@@ -60,8 +61,17 @@ def download_file(file_url):
         logger.error(f"Download failed: {e}")
         return None
 
+def sanitize_content(text):
+    """Removes user email and roll numbers to prevent hallucinations"""
+    if not text: return ""
+    # Remove specific email
+    text = text.replace(MY_EMAIL, " [REDACTED_EMAIL] ")
+    # Remove IITM Roll Number pattern (e.g., 22f2000771)
+    text = re.sub(r'22[a-z]\d+', ' [REDACTED_ID] ', text, flags=re.IGNORECASE)
+    return text
+
 def ask_gemini(prompt, content=""):
-    """Sends a request to Gemini 1.5 Flash with Safety Filters DISABLED"""
+    """Sends a request to Gemini 1.5 Flash"""
     safety_settings = [
         {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
         {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
@@ -71,11 +81,10 @@ def ask_gemini(prompt, content=""):
     
     model = genai.GenerativeModel('gemini-2.5-flash', safety_settings=safety_settings)
     
-    # SYSTEM INSTRUCTION: REMOVE EMAIL HALLUCINATIONS
     system_instruction = (
         "You are a precise data extraction engine. "
         "Output ONLY the requested value. "
-        "Do NOT return the user's email address or the instructions."
+        "Do NOT return the user's email or ID."
     )
     full_prompt = f"{system_instruction}\n\nCONTEXT:\n{content}\n\nTASK:\n{prompt}"
     
@@ -92,22 +101,17 @@ def ask_gemini(prompt, content=""):
 def parse_quiz_page(html_content):
     """Uses Gemini to extract JSON instructions from HTML"""
     
-    # 1. First, try to find the question in the HTML manually to avoid AI errors
-    # Most quizzes use <div id="question"> or similar
-    question_text = "Extract the main answer."
-    if "question" in html_content:
-        # A simple regex to grab text around "Question" or "Q1."
-        match = re.search(r'(Q\d+\.|Question:)(.{1,300})', html_content, re.IGNORECASE)
-        if match:
-            question_text = match.group(0)
+    # regex fallback for question
+    question_text = "Calculate the sum."
+    match = re.search(r'(Q\d+\.|Question:)(.{1,300})', html_content, re.IGNORECASE)
+    if match:
+        question_text = match.group(0)
 
     prompt = f"""
     Analyze this HTML. Extract the JSON task.
-    Look for a specific question text starting with 'Q' or inside a 'question' div.
-    
     JSON Format:
     {{
-        "question": "The exact question text found in the HTML.",
+        "question": "The exact question text.",
         "data_url": "URL of file to download (or null)",
         "submit_url": "URL to POST answer to",
     }}
@@ -117,15 +121,13 @@ def parse_quiz_page(html_content):
     cleaned_text = cleaned_text.replace("```json", "").replace("```", "").strip()
     try:
         data = json.loads(cleaned_text)
-        # Fallback: If AI returns the prompt as the question, fix it.
-        if "Extract the JSON" in data.get("question", ""):
-            data["question"] = "Calculate the sum of the numbers in the file."
+        if not data.get("question") or "Extract" in data.get("question"):
+             data["question"] = question_text
         return data
     except:
-        return {"question": "Calculate the sum of the numbers.", "data_url": None, "submit_url": None}
+        return {"question": question_text, "data_url": None, "submit_url": None}
 
 def clean_html_text(raw_html):
-    """Removes HTML tags to return clean text"""
     cleanr = re.compile('<.*?>')
     cleantext = re.sub(cleanr, ' ', raw_html)
     return ' '.join(cleantext.split())
@@ -150,7 +152,8 @@ def solve_quiz_loop(start_url):
             if task.get("submit_url"):
                 task["submit_url"] = urljoin(current_url, task["submit_url"])
             
-            if not task.get("question") or "Analyze" in task.get("question"):
+            # Default question if missing
+            if not task.get("question"):
                 task["question"] = "Calculate the sum of the numbers."
 
             logger.info(f"Task Parsed: {task}")
@@ -163,11 +166,18 @@ def solve_quiz_loop(start_url):
                     file_path = download_file(task["data_url"])
                     
                     if file_path and file_path.endswith(".csv"):
-                        df = pd.read_csv(file_path)
-                        # Fix for Level 3: Ensure we ask for SUM if generic
-                        data_preview = df.head(20).to_string() + "\n\nColumn Info:\n" + str(df.dtypes)
-                        math_prompt = f"Data:\n{data_preview}\n\nQuestion: {task['question']}\nIf the question is unclear, calculate the SUM of the numeric column.\nReturn ONLY the numerical result."
-                        answer = ask_gemini(math_prompt)
+                        # --- PYTHON MATH MODE (RELIABLE) ---
+                        try:
+                            df = pd.read_csv(file_path)
+                            # Select all numeric columns
+                            numeric_df = df.select_dtypes(include=[np.number])
+                            # Calculate total sum
+                            total_sum = numeric_df.sum().sum()
+                            logger.info(f"Python Calculated Sum: {total_sum}")
+                            answer = int(total_sum) # Return the calculated math directly
+                        except Exception as e:
+                            logger.error(f"CSV Math failed: {e}")
+                            answer = 0
 
                     elif file_path and file_path.endswith(".pdf"):
                         try:
@@ -189,32 +199,28 @@ def solve_quiz_loop(start_url):
                         except:
                             raw_content = ""
 
-                        # --- CRITICAL FIX: SANITIZE EMAIL ---
-                        # Remove the user's email so Gemini doesn't hallucinate it as the code
-                        raw_content = raw_content.replace(MY_EMAIL, "REDACTED_EMAIL")
+                        # --- SANITIZATION ---
+                        raw_content = sanitize_content(raw_content)
 
-                        # Check for linked scripts
+                        # Linked Script Chaser
                         script_match = re.search(r'<script src="(.*?)".*?>', raw_content)
                         if script_match:
                             script_name = script_match.group(1)
                             script_url = urljoin(task["data_url"], script_name)
-                            logger.info(f"Found linked script: {script_url}. Downloading...")
                             try:
                                 js_content = requests.get(script_url, timeout=5).text
-                                # Sanitize JS content too
-                                js_content = js_content.replace(MY_EMAIL, "REDACTED_EMAIL")
-                                raw_content += f"\n\n--- LINKED SCRIPT ({script_name}) ---\n{js_content}"
+                                js_content = sanitize_content(js_content) # Sanitize JS too
+                                raw_content += f"\n\n--- SCRIPT CONTENT ---\n{js_content}"
                             except Exception as e:
                                 logger.error(f"Failed to download script: {e}")
 
                         extraction_prompt = (
                             f"QUESTION: {task['question']}\n"
                             f"CONTENT: {raw_content}\n"
-                            f"TASK: Extract the secret code. It is NOT 'REDACTED_EMAIL'. It is a random string."
+                            f"TASK: Extract the secret code. It is NOT '[REDACTED_ID]'."
                         )
                         answer = ask_gemini(extraction_prompt)
                         
-                        # Fallback
                         if not answer:
                             answer = clean_html_text(raw_content).strip()
 

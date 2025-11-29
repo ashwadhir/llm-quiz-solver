@@ -49,7 +49,7 @@ def download_file(file_url):
     """Downloads a file to /tmp/"""
     try:
         filename = file_url.split("/")[-1].split("?")[0]
-        if not filename: filename = "downloaded_data"
+        if not filename: filename = f"data_{int(time.time())}"
         local_filename = f"/tmp/{filename}"
         
         logger.info(f"Downloading {file_url} to {local_filename}")
@@ -83,7 +83,6 @@ def ask_gemini(prompt, content=""):
     
     model = genai.GenerativeModel('gemini-2.5-flash', safety_settings=safety_settings)
     
-    # Sanitize Prompt and Context before sending
     prompt = global_sanitizer(prompt)
     content = global_sanitizer(content)
 
@@ -120,7 +119,7 @@ def ask_gemini_audio(prompt, audio_path):
         return "0"
 
 def parse_quiz_page(html_content):
-    # Regex fallback for question
+    # Regex fallback
     question_text = "Calculate the sum."
     match = re.search(r'(Q\d+\.|Question:)(.{1,300})', html_content, re.IGNORECASE)
     if match:
@@ -128,6 +127,8 @@ def parse_quiz_page(html_content):
 
     prompt = f"""
     Analyze this HTML. Extract the JSON task.
+    If there are multiple file links, prioritize Audio (.opus, .mp3).
+    
     JSON Format:
     {{
         "question": "The exact question text.",
@@ -174,7 +175,6 @@ def solve_quiz_loop(start_url):
             if not task.get("question"):
                 task["question"] = "Calculate the sum of the numbers."
 
-            # SANITIZE TASK
             task["question"] = global_sanitizer(task["question"])
             logger.info(f"Task Parsed: {task}")
             
@@ -193,26 +193,22 @@ def solve_quiz_loop(start_url):
                         math_prompt = f"Listen to this audio. {task['question']}. If asked for a sum, extract the numbers and sum them. Return ONLY the result."
                         answer = ask_gemini_audio(math_prompt, file_path)
 
-                    # 2. CSV FILES (SMART COLUMN SELECTOR)
+                    # 2. CSV FILES (FIXED HEADER LOGIC)
                     elif file_path.endswith(".csv"):
                         try:
+                            # Read normally first
                             df = pd.read_csv(file_path)
-                            cols = df.columns.tolist()
                             
-                            # Ask Gemini which column to sum
-                            col_prompt = f"Question: {task['question']}\nCSV Columns: {cols}\nWhich column name should be summed? Return ONLY the column name."
-                            target_col = ask_gemini(col_prompt).strip().replace("'", "").replace('"', "")
-                            
-                            if target_col in df.columns and pd.api.types.is_numeric_dtype(df[target_col]):
-                                total_sum = df[target_col].sum()
-                                logger.info(f"Summing column '{target_col}': {total_sum}")
-                                answer = int(total_sum)
-                            else:
-                                # Fallback: Sum ALL numeric columns if Gemini fails
-                                numeric_df = df.select_dtypes(include=[np.number])
-                                total_sum = numeric_df.sum().sum()
-                                logger.info(f"Summing ALL numeric columns: {total_sum}")
-                                answer = int(total_sum) 
+                            # CRITICAL FIX: Check if header is actually data (numeric)
+                            # If columns look like numbers, reload with header=None
+                            if any(str(col).replace('.','',1).isdigit() for col in df.columns):
+                                logger.info("Detected numeric header. Reloading with header=None")
+                                df = pd.read_csv(file_path, header=None)
+
+                            numeric_df = df.select_dtypes(include=[np.number])
+                            total_sum = numeric_df.sum().sum()
+                            logger.info(f"Python Calculated Sum: {total_sum}")
+                            answer = int(total_sum)
                         except Exception as e:
                             logger.error(f"CSV Math failed: {e}")
                             answer = 0
@@ -230,7 +226,7 @@ def solve_quiz_loop(start_url):
                         except:
                             answer = "0"
 
-                    # 4. GENERIC FILES (Script/HTML)
+                    # 4. GENERIC FILES (Script Chaser)
                     else:
                         try:
                             with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -240,17 +236,30 @@ def solve_quiz_loop(start_url):
 
                         raw_content = global_sanitizer(raw_content)
 
-                        # Linked Script Chaser
+                        # --- RECURSIVE SCRIPT CHASER ---
+                        # 1. Look for <script src="...">
                         script_match = re.search(r'<script.*?src=["\'](.*?)["\'].*?>', raw_content)
                         if script_match:
                             script_name = script_match.group(1)
                             script_url = urljoin(task["data_url"], script_name)
                             try:
                                 js_content = requests.get(script_url, timeout=5).text
-                                js_content = global_sanitizer(js_content)
-                                raw_content += f"\n\n--- SCRIPT CONTENT ---\n{js_content}"
-                            except:
-                                pass
+                                raw_content += f"\n\n--- LINKED SCRIPT ({script_name}) ---\n{js_content}"
+                            except: pass
+
+                        # 2. Look for 'import ... from "..."'
+                        import_match = re.search(r'import.*?from\s+["\'](.*?)["\']', raw_content)
+                        if import_match:
+                            import_name = import_match.group(1)
+                            import_url = urljoin(task["data_url"], import_name)
+                            logger.info(f"Found Import: {import_url}. Downloading...")
+                            try:
+                                imported_content = requests.get(import_url, timeout=5).text
+                                imported_content = global_sanitizer(imported_content)
+                                raw_content += f"\n\n--- IMPORTED MODULE ({import_name}) ---\n{imported_content}"
+                            except Exception as e:
+                                logger.error(f"Failed to download import: {e}")
+                        # -----------------------------
 
                         extraction_prompt = (
                             f"QUESTION: {task['question']}\n"
@@ -259,24 +268,19 @@ def solve_quiz_loop(start_url):
                         )
                         answer = ask_gemini(extraction_prompt)
                         
-                        # Fallback logic for [SECRET_CODE] hallucination
-                        if not answer or "[" in str(answer) or "REDACTED" in str(answer):
-                            logger.warning("Gemini returned placeholder. Using raw text fallback.")
+                        if not answer or "[" in str(answer):
                             answer = clean_html_text(raw_content).strip()
 
                 else:
-                    # Pure Text Question
                     tone = "Think step by step." if attempt > 0 else "Answer directly."
                     answer = ask_gemini(f"Question: {task['question']}\n{tone}", content=html[:20000])
 
-                # Clean Answer Logic
                 try:
                     clean_ans = str(answer).strip()
                     clean_ans = clean_ans.replace("**", "").replace("`", "").replace('"', '').replace("'", "")
                     if "secret is" in clean_ans.lower():
                         clean_ans = clean_ans.split("secret is")[-1].strip()
                     
-                    # Prevent ID submission
                     if MY_ID_STRING in clean_ans:
                         clean_ans = ""
 
@@ -287,7 +291,6 @@ def solve_quiz_loop(start_url):
                 except:
                     pass
 
-                # 3. Submit
                 payload = {
                     "email": MY_EMAIL,
                     "secret": MY_SECRET,

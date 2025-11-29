@@ -14,7 +14,7 @@ app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-GEMINI_API_KEY = os.getenv("AIzaSyDCQnwC1bp3A7K3gpUebHaFB4eN0YjrjZs")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 MY_SECRET = os.getenv("MY_SECRET", "default_secret")
 MY_EMAIL = os.getenv("MY_EMAIL", "your_email@example.com")
 

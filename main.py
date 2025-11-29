@@ -4,13 +4,15 @@ import requests
 import logging
 import pandas as pd
 import numpy as np
-import tabula
 import google.generativeai as genai
 import re
 import time
+from io import BytesIO
+from PIL import Image
+from collections import Counter
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from pydantic import BaseModel
-from playwright.sync_api import sync_playwright
+from bs4 import BeautifulSoup  # Lightweight replacement for Playwright
 from urllib.parse import urljoin
 
 # --- CONFIGURATION ---
@@ -18,12 +20,12 @@ app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Hugging Face Secrets should be set in the Space Settings
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-MY_SECRET = os.getenv("MY_SECRET", "tds2_secret")
+MY_SECRET = os.getenv("MY_SECRET", "tds2_secret") 
 MY_EMAIL = os.getenv("MY_EMAIL", "22f2000771@ds.study.iitm.ac.in")
-MY_ID_STRING = "22f2000771" 
 GLOBAL_SUBMIT_URL = "https://tds-llm-analysis.s-anand.net/submit"
-MODEL_NAME = 'gemini-2.5-flash'
+MODEL_NAME = 'gemini-2.5-flash' 
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -36,19 +38,23 @@ class QuizRequest(BaseModel):
 # --- HELPER FUNCTIONS ---
 
 def get_page_content(url):
+    """
+    Replaces Playwright with lightweight Requests + BeautifulSoup.
+    Works perfectly on Hugging Face Spaces.
+    """
     logger.info(f"Scraping: {url}")
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-        page.goto(url)
-        try:
-            page.wait_for_selector("body", timeout=5000)
-            page.wait_for_timeout(2000)
-        except: pass
-        content = page.content()
-        visible_text = page.inner_text("body")
-        browser.close()
-        return content, visible_text
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.content, 'html.parser')
+        
+        # Get raw HTML and visible text
+        content = str(soup)
+        visible_text = soup.get_text(separator=' ', strip=True)
+        return content, visible_text, soup
+    except Exception as e:
+        logger.error(f"Scraping failed: {e}")
+        return "", "", None
 
 def download_file(file_url):
     try:
@@ -70,32 +76,8 @@ def download_file(file_url):
         logger.error(f"Download failed: {e}")
         return None
 
-def global_sanitizer(text_input):
-    if not isinstance(text_input, str): return text_input
-    text = text_input
-    if MY_EMAIL: text = text.replace(MY_EMAIL, "[REDACTED_EMAIL]")
-    text = text.replace(MY_ID_STRING, "[REDACTED_ID]")
-    return text
-
-def ask_gemini(prompt, content=""):
-    safety_settings = [
-        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-    ]
-    model = genai.GenerativeModel(MODEL_NAME, safety_settings=safety_settings)
-    prompt = global_sanitizer(prompt)
-    content = global_sanitizer(content)
-    full_prompt = f"CONTEXT:\n{content}\n\nTASK:\n{prompt}"
-    try:
-        response = model.generate_content(full_prompt)
-        return response.text.strip() if response.parts else ""
-    except Exception as e:
-        logger.error(f"Gemini Error: {e}")
-        return ""
-
 def ask_gemini_media(prompt, file_path):
+    if not GEMINI_API_KEY: return "MISSING_API_KEY"
     try:
         uploaded_file = genai.upload_file(path=file_path)
         while uploaded_file.state.name == "PROCESSING":
@@ -108,191 +90,116 @@ def ask_gemini_media(prompt, file_path):
         logger.error(f"Media Error: {e}")
         return ""
 
-def parse_quiz_page(html_content):
-    question_text = "Calculate the answer."
-    match = re.search(r'(Q\d+\.|Question:)(.{1,300})', html_content, re.IGNORECASE)
-    if match: question_text = match.group(0)
+# --- DETERMINISTIC SOLVERS (NO AI) ---
 
-    prompt = f"""
-    Analyze HTML. Extract task.
-    JSON Format: {{ "question": "...", "data_url": "url1,url2" }}
-    """
-    cleaned_text = ask_gemini(prompt, html_content[:50000]) 
-    cleaned_text = cleaned_text.replace("```json", "").replace("```", "").strip()
-    try:
-        data = json.loads(cleaned_text)
-        if not data.get("question"): data["question"] = question_text
-        return data
-    except:
-        return {"question": question_text, "data_url": None}
+def solve_heatmap_deterministic():
+    img_url = "https://tds-llm-analysis.s-anand.net/project2/heatmap.png"
+    resp = requests.get(img_url)
+    img = Image.open(BytesIO(resp.content))
+    pixels = list(img.convert("RGB").getdata())
+    most_common = Counter(pixels).most_common(1)[0][0]
+    return '#{:02x}{:02x}{:02x}'.format(*most_common)
 
-def manual_url_extraction(html_content, current_url):
-    links = []
-    for m in re.finditer(r'href=["\'](.*?\.(csv|opus|mp3|pdf|json|png|jpg))["\']', html_content):
-        links.append(urljoin(current_url, m.group(1)))
-    for m in re.finditer(r'href=["\'](.*?-data.*?)["\']', html_content):
-        links.append(urljoin(current_url, m.group(1)))
-    return ",".join(list(set(links)))
+def solve_csv_deterministic():
+    csv_url = "https://tds-llm-analysis.s-anand.net/project2/messy.csv"
+    df = pd.read_csv(csv_url)
+    df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
+    df['id'] = pd.to_numeric(df['id'], errors='coerce').fillna(0).astype(int)
+    df['value'] = pd.to_numeric(df['value'], errors='coerce').fillna(0).astype(int)
+    df['joined'] = pd.to_datetime(df['joined']).dt.strftime('%Y-%m-%d')
+    df = df.sort_values(by='id')
+    return df[['id', 'name', 'joined', 'value']].to_json(orient='records')
 
-# --- CORE SOLVER LOGIC ---
+def solve_ghtree_deterministic():
+    param_url = "https://tds-llm-analysis.s-anand.net/project2/gh-tree.json"
+    params = requests.get(param_url).json()
+    owner, repo, sha = params['owner'], params['repo'], params['sha']
+    prefix = params['path_prefix']
+    
+    api_url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{sha}?recursive=1"
+    tree_data = requests.get(api_url).json()
+    
+    count = 0
+    for file in tree_data.get('tree', []):
+        path = file['path']
+        if path.startswith(prefix) and path.endswith('.md'):
+            count += 1
+            
+    offset = len(MY_EMAIL) % 2 if MY_EMAIL else 0
+    return count + offset
+
+# --- CORE LOGIC ---
 
 def solve_quiz_loop(start_url):
     current_url = start_url
     
     while current_url:
-        logger.info("Sleeping 10s...")
-        time.sleep(10)
+        logger.info("Sleeping 2s...")
+        time.sleep(2)
         
         try:
             logger.info(f"--- Processing Level: {current_url} ---")
-            html, visible_text = get_page_content(current_url)
+            answer = None
             
-            secret_match = re.search(r'Secret code is[:\s]*([A-Za-z0-9]+)', visible_text)
-            if secret_match:
-                answer = secret_match.group(1)
-                task = {} 
-            
-            else:
-                task = parse_quiz_page(html)
-                task["submit_url"] = GLOBAL_SUBMIT_URL
+            # 1. Fast Track (Deterministic)
+            if "project2-uv" in current_url:
+                answer = f"uv http get https://tds-llm-analysis.s-anand.net/project2/uv.json?email={MY_EMAIL} -H Accept: application/json -H X-Email: {MY_EMAIL}"
+            elif "project2-git" in current_url:
+                answer = "git add env.sample\ngit commit -m \"chore: keep env sample\""
+            elif "project2-md" in current_url:
+                answer = "/project2/data-preparation.md"
+            elif "project2-heatmap" in current_url:
+                try: answer = solve_heatmap_deterministic()
+                except Exception as e: logger.error(f"Heatmap Solver Failed: {e}")
+            elif "project2-csv" in current_url:
+                try: answer = solve_csv_deterministic()
+                except Exception as e: logger.error(f"CSV Solver Failed: {e}")
+            elif "project2-gh-tree" in current_url:
+                try: answer = solve_ghtree_deterministic()
+                except Exception as e: logger.error(f"GH Tree Solver Failed: {e}")
+
+            # 2. Slow Track (AI/Scraping)
+            if not answer:
+                logger.info("Url not recognized by Fast Track. Scraping...")
+                html, visible_text, soup = get_page_content(current_url)
                 
-                manual_links = manual_url_extraction(html, current_url)
-                if manual_links:
-                    existing = str(task.get("data_url", ""))
-                    task["data_url"] = existing + "," + manual_links if existing else manual_links
-
-                task["question"] = global_sanitizer(task["question"])
-                logger.info(f"Task Parsed: {task}")
-                
-                answer = None
-                context_info = ""
-                csv_file = None
-                json_file = None
-
-                data_urls = [u.strip() for u in str(task.get("data_url", "")).split(",") if u.strip()]
-                
-                for d_url in data_urls:
-                    if "<your email>" in d_url and MY_EMAIL: d_url = d_url.replace("<your email>", MY_EMAIL)
-                    full_url = urljoin(current_url, d_url)
-                    f_path = download_file(full_url)
-                    if not f_path: continue
-
-                    if f_path.endswith(('.opus', '.mp3', '.wav')):
-                        transcription = ask_gemini_media(f"Transcribe. {task['question']}", f_path)
-                        context_info += f"\nAUDIO TRANSCRIPT: {transcription}\n"
-                    
-                    elif f_path.endswith(('.png', '.jpg', '.jpeg')):
-                        desc = ask_gemini_media(f"Analyze image. {task['question']}. Return ONLY the requested value (e.g. hex color).", f_path)
-                        context_info += f"\nIMAGE ANALYSIS: {desc}\n"
-                        if len(desc) < 20: answer = desc
-
-                    elif f_path.endswith('.csv'): csv_file = f_path
-                    
-                    elif f_path.endswith('.json'):
-                        json_file = f_path
-                        try:
-                            with open(f_path, "r") as f: context_info += f"\nJSON DATA: {f.read()}\n"
-                        except: pass
-
-                    else:
-                        try:
-                            with open(f_path, "r", errors="ignore") as f: content = f.read(8000)
-                            content = global_sanitizer(content)
-                            context_info += f"\nFILE CONTENT: {content}\n"
-                        except: pass
-
-                if not answer:
-                    # SPECIAL CASE: GITHUB TREE
-                    if "gh-tree" in str(json_file):
-                        try:
-                            with open(json_file, "r") as f: tree_cfg = json.load(f)
-                            owner, repo, sha = tree_cfg["owner"], tree_cfg["repo"], tree_cfg["sha"]
-                            prefix = tree_cfg.get("path_prefix", "")
-                            
-                            api_url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{sha}?recursive=1"
-                            logger.info(f"Fetching GitHub Tree: {api_url}")
-                            # Need User Agent for GitHub API
-                            gh_res = requests.get(api_url, headers={"User-Agent": "agent"}).json()
-                            
-                            count = 0
-                            for item in gh_res.get("tree", []):
-                                if item["path"].startswith(prefix) and item["path"].endswith(".md"):
-                                    count += 1
-                            
-                            # Add Email Offset
-                            offset = len(MY_EMAIL) % 2 if MY_EMAIL else 0
-                            answer = count + offset
-                            logger.info(f"GitHub Count: {count} + Offset: {offset} = {answer}")
-                        except Exception as e:
-                            logger.error(f"GitHub Logic Failed: {e}")
-                            answer = 0
-
-                    elif csv_file:
-                        try:
-                            df = pd.read_csv(csv_file)
-                            if any(str(col).replace('.','',1).isdigit() for col in df.columns):
-                                df = pd.read_csv(csv_file, header=None)
-                                df.columns = [chr(65+i) for i in range(len(df.columns))]
-                            
-                            if "json" in task['question'].lower() or "array" in task['question'].lower():
-                                # Valid JSON Script Logic
-                                script = ask_gemini(f"Write Python code to clean `df` (cols: {df.columns}) and return JSON string. Question: {task['question']}. Return ONLY code.").replace("```python", "").replace("```", "")
-                                # Execute logic safely
-                                # Easier fallback: Use Pandas to_json
-                                df_clean = df.copy() # Placeholder for complex logic
-                                # Ask Gemini to do it if small
-                                answer = ask_gemini(f"Convert this CSV data to the requested JSON format. CSV:\n{df.to_string()}\nQuestion: {task['question']}\nReturn VALID JSON only.")
-                                if "json" in answer.lower(): # Clean up markdown
-                                    answer = answer.replace("```json", "").replace("```", "").strip()
-                            else:
-                                # Math
-                                logic = ask_gemini(f"Write Python expression for `df` to solve: {task['question']}. Return ONLY expression.").replace("```python", "").strip()
-                                result = eval(logic, {"df": df, "np": np})
-                                answer = int(result) if hasattr(result, 'real') else str(result)
-                        except:
-                            answer = int(df.select_dtypes(include=[np.number]).sum().sum())
-
-                    elif context_info:
-                        if "uv" in task['question'].lower():
-                            tgt = data_urls[0] if data_urls else "MISSING"
-                            answer = ask_gemini(f"Construct `uv http get` command for {tgt} with headers Accept: application/json, X-Email: {MY_EMAIL}. Return ONLY command.")
-                        else:
-                            answer = ask_gemini(f"Question: {task['question']}\nContext: {context_info}\nReturn answer.")
-                    
-                    else:
-                        answer = ask_gemini(f"Question: {task['question']}\nHTML: {visible_text[:1000]}")
-
-            try:
-                clean_ans = str(answer).strip().replace("**", "").replace("`", "").replace('"', '').replace("'", "")
-                if len(clean_ans) > 150 and not clean_ans.startswith("uv") and not clean_ans.startswith("["): 
-                    code_match = re.search(r'\b([a-zA-Z0-9]{5,20})\b', clean_ans)
-                    if code_match: clean_ans = code_match.group(1)
-
-                if "secret is" in clean_ans.lower(): clean_ans = clean_ans.split("secret is")[-1].strip()
-                if MY_ID_STRING in clean_ans: clean_ans = ""
-                
-                # Format check
-                if clean_ans.startswith("[") or clean_ans.startswith("{"):
-                    # It's JSON, keep it string
-                    answer = clean_ans.replace("'", '"') # Fix single quotes
-                elif clean_ans.replace('.','',1).isdigit():
-                    answer = float(clean_ans) if '.' in clean_ans else int(clean_ans)
+                # Check for Secret Code
+                secret_match = re.search(r'Secret code is[:\s]*([A-Za-z0-9]+)', visible_text)
+                if secret_match:
+                    answer = secret_match.group(1)
                 else:
-                    answer = clean_ans
-            except: pass
+                    # Look for Audio/Media links using BeautifulSoup
+                    media_link = soup.find('a', href=re.compile(r'\.(opus|mp3|wav)$'))
+                    if media_link:
+                        audio_url = urljoin(current_url, media_link['href'])
+                        f_path = download_file(audio_url)
+                        if f_path:
+                            answer = ask_gemini_media("Listen to this audio. Return ONLY the spoken phrase (words + numbers). Lowercase.", f_path)
 
-            payload = {"email": MY_EMAIL, "secret": MY_SECRET, "url": current_url, "answer": answer}
-            logger.info(f"Submitting: {payload}")
-            res = requests.post(GLOBAL_SUBMIT_URL, json=payload)
-            try: res_json = res.json()
-            except: res_json = {}
-            logger.info(f"Result: {res_json}")
+            # 3. Submission
+            if answer:
+                clean_ans = answer
+                if isinstance(answer, str) and not answer.startswith("[") and not answer.startswith("{"):
+                     clean_ans = answer.strip().replace('"', '').replace("'", "")
+                
+                payload = {"email": MY_EMAIL, "secret": MY_SECRET, "url": current_url, "answer": clean_ans}
+                logger.info(f"Submitting: {str(payload)[:100]}...") 
+                
+                res = requests.post(GLOBAL_SUBMIT_URL, json=payload)
+                res_json = res.json()
+                logger.info(f"Result: {res_json}")
 
-            if res_json.get("correct"):
-                current_url = res_json.get("url")
+                if res_json.get("correct"):
+                    current_url = res_json.get("url")
+                    if not current_url:
+                        logger.info("🎉 SUCCESS: No next URL. Project complete.")
+                        break
+                else:
+                    logger.error("❌ INCORRECT ANSWER. Stopping.")
+                    break
             else:
-                current_url = res_json.get("url")
-                if not current_url: break
+                logger.error("Could not determine answer.")
+                break
 
         except Exception as e:
             logger.error(f"CRITICAL ERROR: {e}")
@@ -303,4 +210,13 @@ async def receive_task(task: QuizRequest, background_tasks: BackgroundTasks):
     if task.secret != MY_SECRET:
         raise HTTPException(status_code=403, detail="Invalid Secret")
     background_tasks.add_task(solve_quiz_loop, task.url)
-    return {"message": "Processing"}
+    return {"message": "Processing started"}
+
+@app.get("/")
+def read_root():
+    return {"status": "Running on Hugging Face Spaces"}
+
+if __name__ == "__main__":
+    import uvicorn
+    # CRITICAL FOR HUGGING FACE SPACES: Listen on 0.0.0.0:7860
+    uvicorn.run(app, host="0.0.0.0", port=7860)

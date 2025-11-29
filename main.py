@@ -8,7 +8,7 @@ import google.generativeai as genai
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from pydantic import BaseModel
 from playwright.sync_api import sync_playwright
-from urllib.parse import urljoin  # <--- NEW IMPORT
+from urllib.parse import urljoin
 
 # --- CONFIGURATION ---
 app = FastAPI()
@@ -36,47 +36,66 @@ def get_page_content(url):
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
         page.goto(url)
-        page.wait_for_selector("body") 
+        # Wait for potential hydration
+        page.wait_for_timeout(1000) 
         content = page.content()
         browser.close()
         return content
 
 def download_file(file_url):
     """Downloads a file to /tmp/ and returns local path"""
-    # Sanitize filename to remove query parameters for saving
-    filename = file_url.split("/")[-1].split("?")[0]
-    local_filename = f"/tmp/{filename}"
-    
-    logger.info(f"Downloading {file_url} to {local_filename}")
-    with requests.get(file_url, stream=True) as r:
-        r.raise_for_status()
-        with open(local_filename, 'wb') as f:
-            for chunk in r.iter_content(chunk_size=8192):
-                f.write(chunk)
-    return local_filename
+    try:
+        filename = file_url.split("/")[-1].split("?")[0]
+        if not filename: filename = "downloaded_data"
+        local_filename = f"/tmp/{filename}"
+        
+        logger.info(f"Downloading {file_url} to {local_filename}")
+        with requests.get(file_url, stream=True, timeout=10) as r:
+            r.raise_for_status()
+            with open(local_filename, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+        return local_filename
+    except Exception as e:
+        logger.error(f"Download failed: {e}")
+        return None
 
 def ask_gemini(prompt, content=""):
-    """Sends a request to gemini-2.5-flash"""
+    """Sends a request to Gemini 2.5 Flash"""
     model = genai.GenerativeModel('gemini-2.5-flash')
-    full_prompt = f"{prompt}\n\nContext:\n{content}"
-    response = model.generate_content(full_prompt)
-    return response.text
+    # System instruction to prevent "Tutorial Mode"
+    system_instruction = "You are a precise data extraction engine. You do NOT write code. You do NOT explain. You only output the requested value."
+    full_prompt = f"{system_instruction}\n\nCONTEXT:\n{content}\n\nTASK:\n{prompt}"
+    try:
+        response = model.generate_content(full_prompt)
+        return response.text.strip()
+    except Exception as e:
+        logger.error(f"Gemini Error: {e}")
+        return ""
 
 def parse_quiz_page(html_content):
     """Uses Gemini to extract JSON instructions from HTML"""
     prompt = """
-    Analyze this HTML. Extract the following JSON:
+    Analyze this HTML. Extract the JSON task.
+    
+    If you see a question text (like "What is the sum...", "Find the code...", "Download file..."), extract it.
+    If the question is implied by a table or list, summarize the task.
+    
+    JSON Format:
     {
-        "question": "The exact question text",
-        "data_url": "The URL of the file to download (or null)",
-        "submit_url": "The URL to POST the answer to",
-        "format": "The expected answer format (number, string, etc.)"
+        "question": "The exact question text. If missing, summarize what needs to be done.",
+        "data_url": "URL of file to download (or null)",
+        "submit_url": "URL to POST answer to",
+        "format": "Expected answer type (number, string, json)"
     }
     Return ONLY raw JSON.
     """
-    cleaned_text = ask_gemini(prompt, html_content[:25000]) 
+    cleaned_text = ask_gemini(prompt, html_content[:40000]) 
     cleaned_text = cleaned_text.replace("```json", "").replace("```", "").strip()
-    return json.loads(cleaned_text)
+    try:
+        return json.loads(cleaned_text)
+    except:
+        return {"question": "Extract data", "data_url": None, "submit_url": None}
 
 # --- CORE SOLVER LOGIC ---
 
@@ -93,13 +112,16 @@ def solve_quiz_loop(start_url):
             # 2. Analyze with Gemini
             task = parse_quiz_page(html)
             
-            # --- CRITICAL FIX: Handle Relative URLs ---
+            # Handle Relative URLs
             if task.get("data_url"):
                 task["data_url"] = urljoin(current_url, task["data_url"])
-            
             if task.get("submit_url"):
                 task["submit_url"] = urljoin(current_url, task["submit_url"])
-                
+            
+            # Fail-safe if question is None
+            if not task.get("question"):
+                task["question"] = "Analyze the data file and extract the key information or result requested."
+
             logger.info(f"Task Parsed: {task}")
             
             # Inner loop for attempts (Max 2 attempts)
@@ -110,36 +132,52 @@ def solve_quiz_loop(start_url):
                 if task.get("data_url"):
                     file_path = download_file(task["data_url"])
                     
-                    if file_path.endswith(".csv"):
+                    if file_path and file_path.endswith(".csv"):
                         df = pd.read_csv(file_path)
-                        data_preview = df.head().to_string() + "\nColumns: " + str(df.columns.tolist())
+                        # Send first 20 rows + column stats to ensure context
+                        data_preview = df.head(20).to_string() + "\n\nColumn Info:\n" + str(df.dtypes)
                         
-                        tone = "Double check your calculation." if attempt > 0 else "Return ONLY the result."
-                        math_prompt = f"Given this CSV data: \n{data_preview}\n\nQuestion: {task['question']}. {tone}"
+                        tone = "Be extremely precise with calculations." if attempt > 0 else "Return ONLY the numerical result."
+                        math_prompt = f"Data:\n{data_preview}\n\nQuestion: {task['question']}\n\n{tone}"
                         answer = ask_gemini(math_prompt)
 
-                    elif file_path.endswith(".pdf"):
-                        # Use Tabula to extract tables
-                        dfs = tabula.read_pdf(file_path, pages='all')
-                        if dfs:
-                            table_str = dfs[0].to_string()
-                            tone = "Verify the numbers carefully." if attempt > 0 else "Return ONLY the result."
-                            math_prompt = f"PDF Table: \n{table_str}\n\nQuestion: {task['question']}. {tone}"
-                            answer = ask_gemini(math_prompt)
-                    else:
-                        # Fallback for text files or scraping
+                    elif file_path and file_path.endswith(".pdf"):
+                        try:
+                            dfs = tabula.read_pdf(file_path, pages='all')
+                            if dfs:
+                                table_str = dfs[0].to_string()
+                                tone = "Check the rows carefully." if attempt > 0 else "Return ONLY the result."
+                                math_prompt = f"PDF Table:\n{table_str}\n\nQuestion: {task['question']}. {tone}"
+                                answer = ask_gemini(math_prompt)
+                            else:
+                                answer = "0" # Fallback
+                        except:
+                            answer = "0"
+
+                    elif file_path:
+                        # GENERIC FILE (HTML/Text/Scrape Target)
+                        # Fix for the "Tutorial Bug"
                         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                            file_content = f.read(2000) # Read first 2k chars
-                        answer = ask_gemini(f"File content: {file_content}\n\nQuestion: {task['question']}")
+                            file_content = f.read(5000) 
+                        
+                        extraction_prompt = (
+                            f"I have downloaded the file mentioned in the question.\n"
+                            f"The file content is provided above.\n"
+                            f"QUESTION: {task['question']}\n"
+                            f"TASK: Look at the file content. Extract the EXACT answer string requested (e.g. a secret code, a flag, a name). "
+                            f"Do NOT write a script. Do NOT explain how to find it. Just output the value found in the text."
+                        )
+                        answer = ask_gemini(extraction_prompt, content=file_content)
 
                 else:
-                    tone = "Think step by step." if attempt > 0 else "Answer briefly."
+                    # Pure Text Question
+                    tone = "Think step by step." if attempt > 0 else "Answer directly."
                     answer = ask_gemini(f"Question: {task['question']}\n{tone}")
 
                 # Clean Answer Logic
                 try:
                     clean_ans = str(answer).strip()
-                    clean_ans = clean_ans.replace("**", "").replace("`", "")
+                    clean_ans = clean_ans.replace("**", "").replace("`", "").replace('"', '').replace("'", "")
                     if clean_ans.replace('.','',1).isdigit():
                         answer = float(clean_ans) if '.' in clean_ans else int(clean_ans)
                     else:
@@ -156,8 +194,19 @@ def solve_quiz_loop(start_url):
                 }
                 logger.info(f"Submission Attempt {attempt+1}: {payload}")
                 
+                # Check for valid Submit URL
+                if not task.get("submit_url"):
+                    logger.error("No submit URL found. Trying default /submit")
+                    task["submit_url"] = urljoin(current_url, "/submit")
+
                 res = requests.post(task["submit_url"], json=payload)
-                res_json = res.json()
+                
+                try:
+                    res_json = res.json()
+                except:
+                    logger.error(f"Non-JSON response: {res.text}")
+                    res_json = {}
+
                 logger.info(f"Result: {res_json}")
 
                 # 4. DECISION MATRIX
@@ -183,7 +232,10 @@ def solve_quiz_loop(start_url):
 
 @app.post("/")
 async def receive_task(task: QuizRequest, background_tasks: BackgroundTasks):
+    # Verify Secret
     if task.secret != MY_SECRET:
         raise HTTPException(status_code=403, detail="Invalid Secret")
+
+    # Start the loop in background
     background_tasks.add_task(solve_quiz_loop, task.url)
-    return {"message": "Processing"}
+    return {"message": "Task processing started"}

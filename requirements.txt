@@ -3,3 +3,8 @@ uvicorn
 requests
 playwright
 pydantic
+google-generativeai
+tabula-py
+pandas
+numpy
+python-multipart

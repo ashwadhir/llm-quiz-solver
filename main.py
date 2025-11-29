@@ -23,6 +23,7 @@ MY_SECRET = os.getenv("MY_SECRET", "tds2_secret")
 MY_EMAIL = os.getenv("MY_EMAIL", "22f2000771@ds.study.iitm.ac.in")
 MY_ID_STRING = "22f2000771" 
 MODEL_NAME = 'gemini-2.5-flash'
+GLOBAL_SUBMIT_URL = "https://tds-llm-analysis.s-anand.net/submit"
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -35,7 +36,6 @@ class QuizRequest(BaseModel):
 # --- HELPER FUNCTIONS ---
 
 def get_page_content(url):
-    """Scrapes dynamic HTML using Playwright"""
     logger.info(f"Scraping: {url}")
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -45,21 +45,17 @@ def get_page_content(url):
             page.wait_for_selector("body", timeout=5000)
             page.wait_for_timeout(2000)
         except: pass
-        
         content = page.content()
         visible_text = page.inner_text("body")
         browser.close()
         return content, visible_text
 
 def download_file(file_url):
-    """Downloads a file to /tmp/"""
     try:
-        # Fix placeholders in URL (e.g. <your email>)
+        # Fix placeholders
         if "<your email>" in file_url and MY_EMAIL:
             file_url = file_url.replace("<your email>", MY_EMAIL)
-        if "YOUR_EMAIL" in file_url and MY_EMAIL:
-            file_url = file_url.replace("YOUR_EMAIL", MY_EMAIL)
-
+            
         filename = file_url.split("/")[-1].split("?")[0]
         if not filename: filename = f"data_{int(time.time())}"
         local_filename = f"/tmp/{filename}"
@@ -121,7 +117,7 @@ def parse_quiz_page(html_content):
 
     prompt = f"""
     Analyze HTML. Extract task.
-    JSON Format: {{ "question": "...", "data_url": "url1,url2", "submit_url": "..." }}
+    JSON Format: {{ "question": "...", "data_url": "url1,url2" }}
     """
     cleaned_text = ask_gemini(prompt, html_content[:50000]) 
     cleaned_text = cleaned_text.replace("```json", "").replace("```", "").strip()
@@ -130,13 +126,18 @@ def parse_quiz_page(html_content):
         if not data.get("question"): data["question"] = question_text
         return data
     except:
-        return {"question": question_text, "data_url": None, "submit_url": None}
+        return {"question": question_text, "data_url": None}
 
 def manual_url_extraction(html_content, current_url):
     links = []
+    # Catch JSON, CSV, Audio
     for m in re.finditer(r'href=["\'](.*?\.(csv|opus|mp3|pdf|json))["\']', html_content):
         links.append(urljoin(current_url, m.group(1)))
+    # Catch relative data endpoints
     for m in re.finditer(r'href=["\'](.*?-data.*?)["\']', html_content):
+        links.append(urljoin(current_url, m.group(1)))
+    # Catch parameterized links (like uv.json?email=...)
+    for m in re.finditer(r'href=["\'](.*?\?email=.*?)["\']', html_content):
         links.append(urljoin(current_url, m.group(1)))
     return ",".join(list(set(links)))
 
@@ -150,23 +151,17 @@ def solve_quiz_loop(start_url):
             logger.info(f"--- Processing Level: {current_url} ---")
             html, visible_text = get_page_content(current_url)
             
-            # FAST PATH: Check visible text for secret
+            # FAST PATH: Visible Secret
             secret_match = re.search(r'Secret code is[:\s]*([A-Za-z0-9]+)', visible_text)
             if secret_match:
-                task = parse_quiz_page(html)
                 answer = secret_match.group(1)
+                task = {} # Dummy
             
             else:
                 task = parse_quiz_page(html)
                 
-                # --- URL FIXING LOGIC ---
-                if task.get("submit_url"): 
-                    task["submit_url"] = urljoin(current_url, task["submit_url"])
-                
-                # CRITICAL FIX: If submit_url is same as current page, force global submit
-                if task.get("submit_url") == current_url:
-                    task["submit_url"] = urljoin(current_url, "/submit")
-                    logger.info("Fixed Submit URL to global endpoint")
+                # CRITICAL FIX: FORCE GLOBAL SUBMIT URL
+                task["submit_url"] = GLOBAL_SUBMIT_URL
                 
                 manual_links = manual_url_extraction(html, current_url)
                 if manual_links:
@@ -183,6 +178,10 @@ def solve_quiz_loop(start_url):
                 data_urls = [u.strip() for u in str(task.get("data_url", "")).split(",") if u.strip()]
                 
                 for d_url in data_urls:
+                    # Fix email placeholders in URL
+                    if "<your email>" in d_url and MY_EMAIL:
+                        d_url = d_url.replace("<your email>", MY_EMAIL)
+
                     full_url = urljoin(current_url, d_url)
                     f_path = download_file(full_url)
                     if not f_path: continue
@@ -201,10 +200,11 @@ def solve_quiz_loop(start_url):
                         except: pass
                     
                     else:
+                        # Generic (JSON/Text/Script)
                         try:
                             with open(f_path, "r", errors="ignore") as f: content = f.read(8000)
                             content = global_sanitizer(content)
-                            context_info += f"\nFILE CONTENT: {content}\n"
+                            context_info += f"\nFILE ({d_url}) CONTENT: {content}\n"
                         except: pass
 
                 if csv_file:
@@ -227,21 +227,33 @@ def solve_quiz_loop(start_url):
                         answer = int(df.select_dtypes(include=[np.number]).sum().sum())
 
                 elif context_info:
-                    solve_prompt = (
-                        f"Question: {task['question']}\nContext: {context_info}\n"
-                        f"Extract the answer. Return ONLY the code/command string."
-                    )
-                    answer = ask_gemini(solve_prompt)
+                    # SPECIAL CASE: UV Command Construction
+                    if "uv" in task['question'].lower() and "http" in task['question'].lower():
+                        target_url = data_urls[0] if data_urls else "MISSING_URL"
+                        # Explicitly tell Gemini to use the found URL
+                        solve_prompt = (
+                            f"Task: Construct a `uv http get` command.\n"
+                            f"Target URL: {target_url}\n"
+                            f"Headers: Accept: application/json, X-Email: {MY_EMAIL}\n"
+                            f"Return ONLY the one-line command string."
+                        )
+                        answer = ask_gemini(solve_prompt)
+                    else:
+                        solve_prompt = (
+                            f"Question: {task['question']}\nContext: {context_info}\n"
+                            f"Extract the answer. Return ONLY the code/command string."
+                        )
+                        answer = ask_gemini(solve_prompt)
                 
                 else:
                     answer = ask_gemini(f"Question: {task['question']}\nHTML: {visible_text[:1000]}")
 
-            # CLEANUP (Relaxed for Commands)
+            # CLEANUP
             try:
                 clean_ans = str(answer).strip().replace("**", "").replace("`", "").replace('"', '').replace("'", "")
                 
-                # CRITICAL FIX: Only aggressive filter if it looks like a paragraph
-                if len(clean_ans) > 150: 
+                # RELAXED FILTER: Allow long answers if they start with 'uv'
+                if len(clean_ans) > 150 and not clean_ans.startswith("uv"): 
                     code_match = re.search(r'\b([a-zA-Z0-9]{5,20})\b', clean_ans)
                     if code_match: clean_ans = code_match.group(1)
 
@@ -256,17 +268,13 @@ def solve_quiz_loop(start_url):
 
             # SUBMIT
             payload = {"email": MY_EMAIL, "secret": MY_SECRET, "url": current_url, "answer": answer}
-            if not task.get("submit_url"): task["submit_url"] = urljoin(current_url, "/submit")
             
-            logger.info(f"Submitting: {payload}")
-            res = requests.post(task["submit_url"], json=payload)
-            
-            # Handle non-JSON response (404/500 pages)
+            logger.info(f"Submitting to GLOBAL: {payload}")
+            res = requests.post(GLOBAL_SUBMIT_URL, json=payload)
             try:
                 res_json = res.json()
             except:
-                logger.error(f"Server returned non-JSON: {res.text[:200]}")
-                # Retry strategy could go here, but usually indicates bad URL
+                logger.error(f"Server returned: {res.text[:200]}")
                 res_json = {}
 
             logger.info(f"Result: {res_json}")

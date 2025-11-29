@@ -76,7 +76,7 @@ def global_sanitizer(text_input):
     return text
 
 def ask_gemini(prompt, content=""):
-    """Sends a request to Gemini 1.5 Flash"""
+    """Sends a request to Gemini 2.5 Flash"""
     safety_settings = [
         {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
         {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
@@ -84,7 +84,7 @@ def ask_gemini(prompt, content=""):
         {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
     ]
     
-    model = genai.GenerativeModel('gemini-1.5-flash', safety_settings=safety_settings)
+    model = genai.GenerativeModel('gemini-2.5-flash', safety_settings=safety_settings)
     
     # Sanitize Prompt and Context before sending
     prompt = global_sanitizer(prompt)

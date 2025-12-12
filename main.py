@@ -19,17 +19,16 @@ app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# LOAD ALL KEYS
+# LOAD KEYS
 KEYS = []
 if os.getenv("GEMINI_API_KEY"): KEYS.append(os.getenv("GEMINI_API_KEY"))
 if os.getenv("GEMINI_API_KEY_2"): KEYS.append(os.getenv("GEMINI_API_KEY_2"))
-# Add more if you have them: GEMINI_API_KEY_3, etc.
 
 MY_SECRET = os.getenv("MY_SECRET", "tds2_secret")
 MY_EMAIL = os.getenv("MY_EMAIL", "22f2000771@ds.study.iitm.ac.in")
 MY_ID_STRING = "22f2000771" 
 GLOBAL_SUBMIT_URL = "https://tds-llm-analysis.s-anand.net/submit"
-MODEL_NAME = 'gemini-2.5-flash' # Using your preferred model
+MODEL_NAME = 'gemini-2.5-flash'
 
 class QuizRequest(BaseModel):
     email: str
@@ -39,9 +38,8 @@ class QuizRequest(BaseModel):
 # --- HELPER FUNCTIONS ---
 
 def get_next_key():
-    """Rotates keys to avoid Rate Limits"""
     if not KEYS: return None
-    key = random.choice(KEYS) # Random rotation is simple and effective
+    key = random.choice(KEYS)
     genai.configure(api_key=key)
     return key
 
@@ -88,12 +86,12 @@ def global_sanitizer(text_input):
     return text
 
 def safe_generate_content(prompt_content, is_media=False, media_file=None):
-    """Smart Retry with Key Rotation"""
-    max_retries = len(KEYS) * 2 # Try every key twice
+    """Robust Retry Logic with Longer Sleeps"""
+    max_retries = len(KEYS) * 3 
     
     for attempt in range(max_retries):
         try:
-            get_next_key() # Rotate key
+            get_next_key() 
             model = genai.GenerativeModel(MODEL_NAME)
             
             if is_media and media_file:
@@ -104,32 +102,29 @@ def safe_generate_content(prompt_content, is_media=False, media_file=None):
         except Exception as e:
             err_str = str(e)
             if "429" in err_str or "Quota" in err_str:
-                logger.warning(f"Rate Limit Hit. Switching Key... (Attempt {attempt+1})")
-                time.sleep(2) # Short sleep to let the switch happen cleanly
+                # INCREASED SLEEP TO 15s to allow 2.5-flash quota to reset
+                logger.warning(f"Rate Limit 429. Sleeping 15s... (Attempt {attempt+1})")
+                time.sleep(15) 
             else:
                 logger.error(f"Gemini Error: {e}")
-                return None
+                time.sleep(5)
     return None
 
 def ask_gemini(prompt, content=""):
     prompt = global_sanitizer(prompt)
     content = global_sanitizer(content)
     full_prompt = f"CONTEXT:\n{content}\n\nTASK:\n{prompt}"
-    
     response = safe_generate_content(full_prompt)
     return response.text.strip() if response and response.parts else ""
 
 def ask_gemini_media(prompt, file_path):
     logger.info(f"Processing Media: {file_path}")
     try:
-        # File upload needs a key too, so we set it first
-        get_next_key() 
+        get_next_key()
         uploaded_file = genai.upload_file(path=file_path)
-        
         while uploaded_file.state.name == "PROCESSING":
             time.sleep(1)
             uploaded_file = genai.get_file(uploaded_file.name)
-        
         response = safe_generate_content(prompt, is_media=True, media_file=uploaded_file)
         return response.text.strip() if response else ""
     except Exception as e:
@@ -168,8 +163,6 @@ def solve_quiz_loop(start_url):
     current_url = start_url
     
     while current_url:
-        # NO SLEEP NEEDED - Keys will rotate automatically
-        
         try:
             logger.info(f"--- Processing Level: {current_url} ---")
             html, visible_text = get_page_content(current_url)
@@ -257,6 +250,7 @@ def solve_quiz_loop(start_url):
                     elif context_info:
                         if "uv" in task['question'].lower():
                             tgt = data_urls[0] if data_urls else "MISSING"
+                            # STRICTER PROMPT FOR UV
                             answer = ask_gemini(f"Construct `uv http get` command for {tgt}.\nHeaders: Accept: application/json.\nDo NOT add X-Email unless asked.\nUse short flags (-H).\nReturn ONLY command.")
                         else:
                             answer = ask_gemini(f"Question: {task['question']}\nContext: {context_info}\nReturn answer.")

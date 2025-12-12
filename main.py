@@ -21,9 +21,9 @@ logger = logging.getLogger(__name__)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 MY_SECRET = os.getenv("MY_SECRET", "tds2_secret")
 MY_EMAIL = os.getenv("MY_EMAIL", "22f2000771@ds.study.iitm.ac.in")
-MY_ID_STRING = "22f2000771" 
-GLOBAL_SUBMIT_URL = "https://tds-llm-analysis.s-anand.net/submit"
+MY_ID_STRING = "22f2000771" # Hardcoded ID to scrub
 MODEL_NAME = 'gemini-2.5-flash'
+GLOBAL_SUBMIT_URL = "https://tds-llm-analysis.s-anand.net/submit"
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -187,13 +187,7 @@ def solve_quiz_loop(start_url):
                         if len(desc) < 20: answer = desc
 
                     elif f_path.endswith('.csv'): csv_file = f_path
-                    
-                    elif f_path.endswith('.json'):
-                        json_file = f_path
-                        try:
-                            with open(f_path, "r") as f: context_info += f"\nJSON DATA: {f.read()}\n"
-                        except: pass
-
+                    elif f_path.endswith('.json'): json_file = f_path
                     else:
                         try:
                             with open(f_path, "r", errors="ignore") as f: content = f.read(8000)
@@ -202,8 +196,8 @@ def solve_quiz_loop(start_url):
                         except: pass
 
                 if not answer:
-                    # SPECIAL CASE: GITHUB TREE
-                    if "gh-tree" in str(json_file):
+                    # LEVEL 8: GITHUB TREE
+                    if json_file and "gh-tree" in str(json_file):
                         try:
                             with open(json_file, "r") as f: tree_cfg = json.load(f)
                             owner, repo, sha = tree_cfg["owner"], tree_cfg["repo"], tree_cfg["sha"]
@@ -211,7 +205,6 @@ def solve_quiz_loop(start_url):
                             
                             api_url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{sha}?recursive=1"
                             logger.info(f"Fetching GitHub Tree: {api_url}")
-                            # Need User Agent for GitHub API
                             gh_res = requests.get(api_url, headers={"User-Agent": "agent"}).json()
                             
                             count = 0
@@ -219,14 +212,14 @@ def solve_quiz_loop(start_url):
                                 if item["path"].startswith(prefix) and item["path"].endswith(".md"):
                                     count += 1
                             
-                            # Add Email Offset
                             offset = len(MY_EMAIL) % 2 if MY_EMAIL else 0
                             answer = count + offset
-                            logger.info(f"GitHub Count: {count} + Offset: {offset} = {answer}")
+                            logger.info(f"GitHub Answer: {count} + {offset} = {answer}")
                         except Exception as e:
                             logger.error(f"GitHub Logic Failed: {e}")
                             answer = 0
 
+                    # LEVEL 7: CSV (JSON or SUM)
                     elif csv_file:
                         try:
                             df = pd.read_csv(csv_file)
@@ -234,31 +227,28 @@ def solve_quiz_loop(start_url):
                                 df = pd.read_csv(csv_file, header=None)
                                 df.columns = [chr(65+i) for i in range(len(df.columns))]
                             
+                            preview = df.head().to_string()
+                            
                             if "json" in task['question'].lower() or "array" in task['question'].lower():
-                                # Valid JSON Script Logic
-                                script = ask_gemini(f"Write Python code to clean `df` (cols: {df.columns}) and return JSON string. Question: {task['question']}. Return ONLY code.").replace("```python", "").replace("```", "")
-                                # Execute logic safely
-                                # Easier fallback: Use Pandas to_json
-                                df_clean = df.copy() # Placeholder for complex logic
-                                # Ask Gemini to do it if small
-                                answer = ask_gemini(f"Convert this CSV data to the requested JSON format. CSV:\n{df.to_string()}\nQuestion: {task['question']}\nReturn VALID JSON only.")
-                                if "json" in answer.lower(): # Clean up markdown
-                                    answer = answer.replace("```json", "").replace("```", "").strip()
+                                # Force valid JSON generation
+                                ans_str = ask_gemini(f"Convert this CSV data to the requested JSON format.\nCSV:\n{df.to_string()}\nQuestion: {task['question']}\nReturn VALID JSON STRING only.")
+                                if "json" in ans_str.lower():
+                                    ans_str = ans_str.replace("```json", "").replace("```", "").strip()
+                                answer = ans_str
                             else:
-                                # Math
                                 logic = ask_gemini(f"Write Python expression for `df` to solve: {task['question']}. Return ONLY expression.").replace("```python", "").strip()
                                 result = eval(logic, {"df": df, "np": np})
                                 answer = int(result) if hasattr(result, 'real') else str(result)
                         except:
                             answer = int(df.select_dtypes(include=[np.number]).sum().sum())
 
+                    # LEVEL 1-6
                     elif context_info:
                         if "uv" in task['question'].lower():
                             tgt = data_urls[0] if data_urls else "MISSING"
                             answer = ask_gemini(f"Construct `uv http get` command for {tgt} with headers Accept: application/json, X-Email: {MY_EMAIL}. Return ONLY command.")
                         else:
                             answer = ask_gemini(f"Question: {task['question']}\nContext: {context_info}\nReturn answer.")
-                    
                     else:
                         answer = ask_gemini(f"Question: {task['question']}\nHTML: {visible_text[:1000]}")
 
@@ -271,10 +261,9 @@ def solve_quiz_loop(start_url):
                 if "secret is" in clean_ans.lower(): clean_ans = clean_ans.split("secret is")[-1].strip()
                 if MY_ID_STRING in clean_ans: clean_ans = ""
                 
-                # Format check
+                # Check for JSON or Number
                 if clean_ans.startswith("[") or clean_ans.startswith("{"):
-                    # It's JSON, keep it string
-                    answer = clean_ans.replace("'", '"') # Fix single quotes
+                    answer = clean_ans.replace("'", '"')
                 elif clean_ans.replace('.','',1).isdigit():
                     answer = float(clean_ans) if '.' in clean_ans else int(clean_ans)
                 else:

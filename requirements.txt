@@ -8,3 +8,4 @@ tabula-py
 pandas
 numpy
 python-multipart
+Pillow
